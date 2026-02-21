@@ -149,11 +149,31 @@ For a conversation object `**convo`**:
 **Any** SDK method that performs an HTTP request to a server that might return **HTTP 402 Payment Required** should use the same response pattern described here. That includes:
 
 - **A2A:** `messageA2A`, `listTasks`, and every task-handle method (`query`, `message`, `cancel`, `subscribe` if it does HTTP).
-- **Future:** MCP tool/resource calls, or other HTTP-based agent operations.
+- **Future:** MCP tool/resource calls, or other HTTP-based agent operations. x402 can be extended later to other surfaces (e.g. **x402‑aware MCP endpoints**—tools, resources, or prompts that may return 402 and use the same payment flow).
 
-So “regular requests” that can respond with 402 are all treated uniformly: the SDK does not throw on 402; it returns a response object that may include `**x402Required`**.
+These methods use a **generic HTTP x402 handler** internally (§4.2). The SDK also exposes that handler so custom or future features can tap into the same 402 flow. On 402 the SDK does not throw; it returns a response object that may include **`x402Required`**.
 
-### 4.2 Response shape when 402 is returned
+### 4.2 Generic HTTP x402 handler
+
+**`sdk.request(options)`** (or **`sdk.fetchWithX402(options)`**) — Performs a single HTTP request with built-in 402 handling. Other SDK features (A2A, MCP, etc.) use this under the hood so 402 behavior is consistent.
+
+**Parameters**
+
+- **url** — Request URL.
+- **method** — HTTP method (e.g. `GET`, `POST`).
+- **headers** *(optional)* — Request headers.
+- **body** *(optional)* — Request body (string or buffer).
+- **parseResponse** *(optional)* — Function that takes the successful response (e.g. 200 body) and returns the typed result. If omitted, the handler may return the raw response or a default parse.
+
+**Behavior**
+
+- Sends the request. If the server responds with **HTTP 402**, the handler parses the 402 body (payment requirements), does **not** throw, and returns a result object with **`x402Required: true`** and **`x402Payment`** (price, token, network, description, **`pay()`**, etc.). **`pay()`** performs the payment (e.g. build payload, sign, send `PAYMENT-SIGNATURE`, retry the **same** request) and resolves with the same shape as a successful call (using `parseResponse` if provided).
+- If the server responds with 2xx, the handler returns the parsed result (via `parseResponse` if provided) or the raw response.
+- Other status codes or network errors are thrown or surfaced per SDK convention.
+
+Callers can use this for arbitrary HTTP endpoints that may return 402; A2A and MCP methods call it internally with the appropriate URL, body, and parser.
+
+### 4.3 Response shape when 402 is returned
 
 When the server responds with **HTTP 402**:
 
@@ -174,7 +194,7 @@ When the server responds with **HTTP 402**:
 - `**maxAmountRequired**` — if different from `price` (x402 body may use this).
 - Other fields from the 402 response body (see [x402 HTTP 402](https://x402.gitbook.io/x402/core-concepts/http-402)) as needed.
 
-### 4.3 Usage pattern
+### 4.4 Usage pattern
 
 Caller (or autonomous agent) can inspect payment details before calling `pay()`:
 
@@ -191,17 +211,17 @@ if (response.x402Required) {
 }
 ```
 
-Same pattern for any other payable method:
+Same pattern for any other payable method (e.g. A2A list tasks):
 
 ```ts
-const listResult = await agent.listTasks({ filter: { status: 'open' } });
-if (listResult.x402Required) {
-  const paidResult = await listResult.x402Payment.pay();
-  // paidResult = normal list result (tasks + optional nextPageToken)
+const a2aResult = await agent.listTasks({ filter: { status: 'open' } });
+if (a2aResult.x402Required) {
+  const paid = await a2aResult.x402Payment.pay();
+  // paid = normal list result (tasks + optional nextPageToken)
 }
 ```
 
-### 4.4 Pay() behavior and errors
+### 4.5 Pay() behavior and errors
 
 - `**pay()**` — Resolves when the payment has been sent and the **retried** request succeeds. Return value = result of the retried request (no `x402Required` on success).
 - If payment or retry fails (e.g. insufficient funds, server still 402, network error), `**pay()`** rejects with an error. The SDK does not retry indefinitely.
@@ -219,4 +239,4 @@ if (listResult.x402Required) {
 - **x402Payment** — at least `price`, `token`, `pay()`. Optionally `network`, `description`, `scheme`, `maxAmountRequired`, and other 402 body fields.
 - **Conversation handle** — `history()`, `message(content)`. Obtained from listing (`sdk.xmtpConversations()` / `agent.xmtpConversations()`) or from `newDm(peerAddress)` (1:1, one per pair) or `newGroup([options])` (groups for multi-party or task-specific threads).
 
-All “payable” methods: their return type is effectively `NormalResult | { x402Required: true; x402Payment: X402Payment }`, where `NormalResult` is the success type for that method.
+All “payable” methods: their return type is effectively `NormalResult | { x402Required: true; x402Payment: X402Payment }`, where `NormalResult` is the success type for that method. They use **`sdk.request(options)`** (generic HTTP x402 handler) internally; that method is also exposed for custom or arbitrary HTTP calls that may return 402.
