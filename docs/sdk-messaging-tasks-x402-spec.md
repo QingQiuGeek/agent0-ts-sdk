@@ -72,14 +72,15 @@ Returns a list of tasks for this agent. Use when you don’t have a `taskId` yet
 
 **Options** *(optional)*
 
-- **filter** — e.g. by `**contextId`** (tasks in that conversation only), by status (`open`, `completed`, `failed`, `canceled`), or other A2A list filters.
-- **pagination** — e.g. `pageSize`, `pageToken` (from a previous `listTasks` response).
+- **filter** — e.g. by **`contextId`** (tasks in that conversation only), by status (`open`, `completed`, `failed`, `canceled`), or other A2A list filters.
 - **historyLength** — max number of messages to include per task in the list response (0 to omit history).
 
 **Returns**
 
-- List of task summaries or full task objects (per options), plus optional `nextPageToken` for pagination.
-- May include `**x402Required`** if the list endpoint returns HTTP 402 (see §4).
+- List of **all** task summaries or full task objects matching the filter (per options). The SDK fetches all pages internally; callers receive a single array.
+- May include **`x402Required`** if the list endpoint returns HTTP 402 (see §4).
+
+*Implementation note:* The SDK may use A2A cursor pagination (pageSize/pageToken) under the hood until no more pages; the public API does not expose pagination.
 
 ### 2.4 Task handle (AgentTask)
 
@@ -212,7 +213,7 @@ Same pattern for any other payable method (e.g. A2A list tasks):
 const a2aResult = await agent.listTasks({ filter: { status: 'open' } });
 if (a2aResult.x402Required) {
   const paid = await a2aResult.x402Payment.pay();
-  // paid = normal list result (tasks + optional nextPageToken)
+  // paid = normal list result (array of all tasks)
 }
 ```
 
@@ -233,7 +234,7 @@ Response objects are typed so the SDK and callers work with **MessageResponse** 
 - **MessageResponse** — Interface: message content (e.g. `content?: string`, `parts?: Part[]`), optional `contextId`. No `task` or `taskId`.
 - **TaskResponse** — Interface: `**taskId: string`**; `**contextId: string`**; `**task: AgentTask**`; optional task snapshot. Has `task` and `taskId`; use these to narrow from the union.
 - **Response union** — `messageA2A` returns `**MessageResponse | TaskResponse`**. Narrow by shape: e.g. `if ('task' in response)` then `response` is TaskResponse and use `response.task` to get the AgentTask.
-- **List tasks result** — list of tasks + optional `nextPageToken`. May include `x402Required` + `x402Payment`.
+- **List tasks result** — array of all tasks (SDK fetches all pages internally). May include `x402Required` + `x402Payment`.
 - **AgentTask** (task handle) — has read-only `**taskId`** and `**contextId**` (strings); methods `query()`, `message()`, `cancel()`. Returned by `response.task` and by `agent.loadTask(taskId)`. Each method may return a result that includes `x402Required` + `x402Payment`.
 - **x402Payment** — `**accepts`** (array of payment options; each has at least `price`, `token`, and optionally `network`, `scheme`, `description`, `maxAmountRequired`). When the endpoint accepts multiple chains/tokens/schemes, `**accepts`** has multiple entries. `**pay(accept?)`** — pass the chosen option when there are multiple, or call `**pay()**` when there is one. Top-level `**price**` / `**token**` / `**network**` may be present for single-option convenience.
 - **Conversation handle** — `history([options])`, `message(content)`. From `**sdk.loadXMTPConversation(peerAddress)`** or `**agent.loadXMTPConversation()**` (conversation with that agent). Send via `**sdk.messageXMTP(peerAddress, content)**` or `**agent.messageXMTP(content)**` to message an agent. Use `**agent.message(content)**` for a unified entry point (A2A first, then XMTP). List via `**sdk.XMTPConversations()**`.
