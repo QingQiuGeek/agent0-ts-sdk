@@ -13,6 +13,9 @@ import type {
   TaskState,
   TaskQueryResult,
   TaskCancelResult,
+  CredentialObject,
+  SecurityScheme,
+  AgentCardAuth,
 } from '../models/a2a.js';
 import { requestWithX402, type X402RequestDeps } from './x402-request.js';
 import type { X402RequestResult, X402RequiredResponse } from './x402-types.js';
@@ -23,11 +26,85 @@ const ERR_NEITHER = 'A2A response contained neither task nor message';
 /** Result of sendMessage or task.message() when 402 is supported (x402Deps provided). */
 export type A2AMessageResult = MessageResponse | TaskResponse | X402RequiredResponse<MessageResponse | TaskResponse>;
 
-function a2aHeaders(a2aVersion: string): Record<string, string> {
-  return { 'Content-Type': 'application/json', 'A2A-Version': a2aVersion };
+export interface A2AAuth {
+  headers: Record<string, string>;
+  queryParams: Record<string, string>;
 }
 
-type CreateTaskHandleFn = (baseUrl: string, a2aVersion: string, taskId: string, contextId: string, x402Deps?: X402RequestDeps) => AgentTask;
+/**
+ * Normalize credential to object; string → { apiKey: string } per spec §2.5.
+ */
+function normalizeCredential(credential: string | CredentialObject): CredentialObject {
+  return typeof credential === 'string' ? { apiKey: credential } : credential;
+}
+
+/**
+ * Apply credential to request using AgentCard securitySchemes and security.
+ * Returns headers and query params to merge into A2A requests. Supported: apiKey (header/query/cookie), http (bearer).
+ */
+export function applyCredential(
+  credential: string | CredentialObject,
+  auth: AgentCardAuth
+): A2AAuth {
+  const out: A2AAuth = { headers: {}, queryParams: {} };
+  const obj = normalizeCredential(credential);
+  const { securitySchemes = {}, security = [] } = auth;
+  const firstRequired = security[0];
+  if (!firstRequired || typeof firstRequired !== 'object') return out;
+
+  const schemeName = Object.keys(firstRequired)[0];
+  if (!schemeName) return out;
+
+  const scheme = securitySchemes[schemeName];
+  if (!scheme || typeof scheme !== 'object') return out;
+
+  const value = obj[schemeName];
+  if (value == null || typeof value !== 'string') return out;
+
+  if (scheme.type === 'apiKey') {
+    const { in: where, name } = scheme;
+    if (where === 'header') out.headers[name] = value;
+    else if (where === 'query') out.queryParams[name] = value;
+    else if (where === 'cookie') out.headers['Cookie'] = `${name}=${encodeURIComponent(value)}`;
+  } else if (scheme.type === 'http') {
+    if (scheme.scheme === 'bearer') {
+      out.headers['Authorization'] = `Bearer ${value}`;
+    } else if (scheme.scheme === 'basic') {
+      // value is "user:password"; encode for Basic auth (Node or browser)
+      const encoded =
+        /^[A-Za-z0-9+/]+=*$/.test(value) && !value.includes(':')
+          ? value
+          : typeof Buffer !== 'undefined'
+            ? Buffer.from(value, 'utf8').toString('base64')
+            : btoa(unescape(encodeURIComponent(value)));
+      out.headers['Authorization'] = `Basic ${encoded}`;
+    }
+  }
+
+  return out;
+}
+
+function a2aHeaders(a2aVersion: string, auth?: A2AAuth): Record<string, string> {
+  const base = { 'Content-Type': 'application/json', 'A2A-Version': a2aVersion };
+  if (!auth?.headers) return base;
+  return { ...base, ...auth.headers };
+}
+
+function appendQueryParams(url: string, queryParams: Record<string, string>): string {
+  if (!queryParams || Object.keys(queryParams).length === 0) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  const pairs = Object.entries(queryParams).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
+  return `${url}${sep}${pairs.join('&')}`;
+}
+
+type CreateTaskHandleFn = (
+  baseUrl: string,
+  a2aVersion: string,
+  taskId: string,
+  contextId: string,
+  x402Deps?: X402RequestDeps,
+  auth?: A2AAuth
+) => AgentTask;
 
 /**
  * Parse JSON response from POST /message:send into MessageResponse or TaskResponse.
@@ -37,14 +114,15 @@ export function parseMessageSendResponse(
   createTaskHandle: CreateTaskHandleFn,
   baseUrl: string,
   a2aVersion: string,
-  x402Deps?: X402RequestDeps
+  x402Deps?: X402RequestDeps,
+  auth?: A2AAuth
 ): MessageResponse | TaskResponse {
   if (data.task != null && typeof data.task === 'object') {
     const taskObj = data.task as Record<string, unknown>;
     const taskId = String(taskObj.id ?? taskObj.taskId ?? '');
     const contextId = String(taskObj.contextId ?? '');
     if (!taskId) throw new Error('A2A task response missing task id');
-    const task = createTaskHandle(baseUrl, a2aVersion, taskId, contextId, x402Deps);
+    const task = createTaskHandle(baseUrl, a2aVersion, taskId, contextId, x402Deps, auth);
     return {
       taskId,
       contextId,
@@ -72,17 +150,19 @@ export async function postAndParseMessageSend(
   baseUrl: string,
   a2aVersion: string,
   body: Record<string, unknown>,
-  createTaskHandle: CreateTaskHandleFn
+  createTaskHandle: CreateTaskHandleFn,
+  auth?: A2AAuth
 ): Promise<MessageResponse | TaskResponse> {
-  const res = await fetch(`${baseUrl}/message:send`, {
+  const url = appendQueryParams(`${baseUrl}/message:send`, auth?.queryParams ?? {});
+  const res = await fetch(url, {
     method: 'POST',
-    headers: a2aHeaders(a2aVersion),
+    headers: a2aHeaders(a2aVersion, auth),
     body: JSON.stringify(body),
   });
   if (res.status === 402) throw new Error(ERR_402);
   if (!res.ok) throw new Error(`A2A request failed: HTTP ${res.status} ${res.statusText}`);
   const data = (await res.json()) as Record<string, unknown>;
-  return parseMessageSendResponse(data, createTaskHandle, baseUrl, a2aVersion);
+  return parseMessageSendResponse(data, createTaskHandle, baseUrl, a2aVersion, undefined, auth);
 }
 
 /**
@@ -94,10 +174,12 @@ export function createTaskHandle(
   a2aVersion: string,
   taskId: string,
   contextId: string,
-  x402Deps?: X402RequestDeps
+  x402Deps?: X402RequestDeps,
+  auth?: A2AAuth
 ): AgentTask {
-  const headers = () => a2aHeaders(a2aVersion);
-  const createTask = (b: string, v: string, tid: string, cid: string) => createTaskHandle(b, v, tid, cid, x402Deps);
+  const headers = () => a2aHeaders(a2aVersion, auth);
+  const createTask = (b: string, v: string, tid: string, cid: string) =>
+    createTaskHandle(b, v, tid, cid, x402Deps, auth);
 
   const task: AgentTask = {
     taskId,
@@ -106,7 +188,8 @@ export function createTaskHandle(
       const params = new URLSearchParams();
       if (options?.historyLength !== undefined) params.set('historyLength', String(options.historyLength));
       const q = params.toString();
-      const url = `${baseUrl}/tasks/${encodeURIComponent(taskId)}${q ? `?${q}` : ''}`;
+      let url = `${baseUrl}/tasks/${encodeURIComponent(taskId)}${q ? `?${q}` : ''}`;
+      url = appendQueryParams(url, auth?.queryParams ?? {});
       if (x402Deps) {
         const result = await requestWithX402<TaskQueryResult>(
           {
@@ -152,26 +235,28 @@ export function createTaskHandle(
       };
       const body = { message };
       if (x402Deps) {
+        const messageSendUrl = appendQueryParams(`${baseUrl}/message:send`, auth?.queryParams ?? {});
         const result = await requestWithX402<MessageResponse | TaskResponse>(
           {
-            url: `${baseUrl}/message:send`,
+            url: messageSendUrl,
             method: 'POST',
             headers: headers(),
             body: JSON.stringify(body),
             parseResponse: async (res) => {
               if (!res.ok) throw new Error(`A2A message failed: HTTP ${res.status}`);
               const data = (await res.json()) as Record<string, unknown>;
-              return parseMessageSendResponse(data, createTask, baseUrl, a2aVersion, x402Deps);
+              return parseMessageSendResponse(data, createTask, baseUrl, a2aVersion, x402Deps, auth);
             },
           },
           x402Deps
         );
         return result;
       }
-      return postAndParseMessageSend(baseUrl, a2aVersion, body, createTask);
+      return postAndParseMessageSend(baseUrl, a2aVersion, body, createTask, auth);
     },
     async cancel() {
-      const url = `${baseUrl}/tasks/${encodeURIComponent(taskId)}:cancel`;
+      let url = `${baseUrl}/tasks/${encodeURIComponent(taskId)}:cancel`;
+      url = appendQueryParams(url, auth?.queryParams ?? {});
       if (x402Deps) {
         const result = await requestWithX402<TaskCancelResult>(
           {
@@ -211,6 +296,8 @@ export interface SendMessageParams {
   a2aVersion: string;
   content: string | { parts: Part[] };
   options?: MessageA2AOptions;
+  /** From AgentCard: where and how to send credential (per §2.5). */
+  auth?: AgentCardAuth;
 }
 
 /**
@@ -221,7 +308,12 @@ export async function sendMessage(
   params: SendMessageParams,
   x402Deps?: X402RequestDeps
 ): Promise<MessageResponse | TaskResponse | X402RequiredResponse<MessageResponse | TaskResponse>> {
-  const { baseUrl, a2aVersion, content, options } = params;
+  const { baseUrl, a2aVersion, content, options, auth: cardAuth } = params;
+  const resolvedAuth =
+    options?.credential != null && cardAuth
+      ? applyCredential(options.credential, cardAuth)
+      : undefined;
+
   const parts: Part[] =
     typeof content === 'string'
       ? [{ text: content }]
@@ -244,17 +336,18 @@ export async function sendMessage(
 
   if (x402Deps) {
     const createTask = (b: string, v: string, tid: string, cid: string) =>
-      createTaskHandle(b, v, tid, cid, x402Deps);
+      createTaskHandle(b, v, tid, cid, x402Deps, resolvedAuth);
+    const messageSendUrl = appendQueryParams(`${baseUrl}/message:send`, resolvedAuth?.queryParams ?? {});
     const result = await requestWithX402<MessageResponse | TaskResponse>(
       {
-        url: `${baseUrl}/message:send`,
+        url: messageSendUrl,
         method: 'POST',
-        headers: a2aHeaders(a2aVersion),
+        headers: a2aHeaders(a2aVersion, resolvedAuth),
         body: JSON.stringify(body),
         parseResponse: async (res) => {
           if (!res.ok) throw new Error(`A2A request failed: HTTP ${res.status} ${res.statusText}`);
           const data = (await res.json()) as Record<string, unknown>;
-          return parseMessageSendResponse(data, createTask, baseUrl, a2aVersion, x402Deps);
+          return parseMessageSendResponse(data, createTask, baseUrl, a2aVersion, x402Deps, resolvedAuth);
         },
       },
       x402Deps
@@ -262,7 +355,11 @@ export async function sendMessage(
     return result;
   }
 
-  return postAndParseMessageSend(baseUrl, a2aVersion, body, (b, v, tid, cid) =>
-    createTaskHandle(b, v, tid, cid)
+  return postAndParseMessageSend(
+    baseUrl,
+    a2aVersion,
+    body,
+    (b, v, tid, cid) => createTaskHandle(b, v, tid, cid, undefined, resolvedAuth),
+    resolvedAuth
   );
 }

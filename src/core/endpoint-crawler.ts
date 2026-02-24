@@ -9,8 +9,14 @@ export interface McpCapabilities {
   mcpResources?: string[];
 }
 
+import type { SecurityScheme, AgentCardAuth } from '../models/a2a.js';
+
 export interface A2aCapabilities {
   a2aSkills?: string[];
+  /** OpenAPI-style securitySchemes from AgentCard (for credential placement per §2.5). */
+  securitySchemes?: Record<string, SecurityScheme>;
+  /** Which schemes are required (e.g. [{ "apiKey": [] }]). */
+  security?: AgentCardAuth['security'];
 }
 
 /**
@@ -246,12 +252,17 @@ export class EndpointCrawler {
           if (response.ok) {
             const data = await response.json();
 
-            // Extract skill tags from agentcard
             const skills = this._extractA2aSkills(data);
+            const auth = this._extractAgentCardAuth(data);
 
-            if (skills && skills.length > 0) {
-              return { a2aSkills: skills };
-            }
+            const capabilities = {
+              ...(skills?.length ? { a2aSkills: skills } : {}),
+              ...(auth.securitySchemes && Object.keys(auth.securitySchemes).length > 0
+                ? { securitySchemes: auth.securitySchemes }
+                : {}),
+              ...(auth.security?.length ? { security: auth.security } : {}),
+            };
+            if (Object.keys(capabilities).length > 0) return capabilities;
           }
         } catch {
           // Try next URL
@@ -263,6 +274,52 @@ export class EndpointCrawler {
     }
 
     return null;
+  }
+
+  /**
+   * Extract securitySchemes and security from AgentCard (OpenAPI 3 style, per spec §2.5).
+   * Supported scheme types: apiKey (in: header|query|cookie, name), http (scheme: bearer).
+   */
+  private _extractAgentCardAuth(data: Record<string, unknown>): AgentCardAuth {
+    const result: AgentCardAuth = {};
+    if (!data || typeof data !== 'object') return result;
+
+    const rawSchemes = data.securitySchemes;
+    if (rawSchemes && typeof rawSchemes === 'object' && !Array.isArray(rawSchemes)) {
+      const schemes: Record<string, SecurityScheme> = {};
+      for (const [name, def] of Object.entries(rawSchemes)) {
+        if (!def || typeof def !== 'object' || Array.isArray(def)) continue;
+        const d = def as Record<string, unknown>;
+        const type = d.type as string;
+        if (type === 'apiKey' && typeof d.in === 'string' && typeof d.name === 'string') {
+          if (['header', 'query', 'cookie'].includes(d.in)) {
+            schemes[name] = { type: 'apiKey', in: d.in as 'header' | 'query' | 'cookie', name: d.name };
+          }
+        } else if (type === 'http' && typeof d.scheme === 'string') {
+          if (d.scheme === 'bearer' || d.scheme === 'basic') {
+            schemes[name] = { type: 'http', scheme: d.scheme as 'bearer' | 'basic' };
+          }
+        }
+      }
+      if (Object.keys(schemes).length > 0) result.securitySchemes = schemes;
+    }
+
+    const rawSecurity = data.security;
+    if (Array.isArray(rawSecurity) && rawSecurity.length > 0) {
+      const security: Array<Record<string, string[]>> = [];
+      for (const entry of rawSecurity) {
+        if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+          const obj: Record<string, string[]> = {};
+          for (const [k, v] of Object.entries(entry)) {
+            if (Array.isArray(v)) obj[k] = v;
+          }
+          if (Object.keys(obj).length > 0) security.push(obj);
+        }
+      }
+      if (security.length > 0) result.security = security;
+    }
+
+    return result;
   }
 
   /**

@@ -9,6 +9,7 @@ import {
   sendMessage,
   createTaskHandle,
   postAndParseMessageSend,
+  applyCredential,
 } from '../src/core/a2a-client.js';
 import type { X402RequestDeps } from '../src/core/x402-request.js';
 import type { RegistrationFile } from '../src/models/interfaces.js';
@@ -126,6 +127,110 @@ describe('parseMessageSendResponse', () => {
   });
 });
 
+describe('applyCredential', () => {
+  it('puts apiKey in header when scheme is apiKey in header', () => {
+    const auth = {
+      securitySchemes: {
+        apiKey: { type: 'apiKey' as const, in: 'header' as const, name: 'X-API-Key' },
+      },
+      security: [{ apiKey: [] }],
+    };
+    const out = applyCredential({ apiKey: 'secret-123' }, auth);
+    expect(out.headers['X-API-Key']).toBe('secret-123');
+    expect(Object.keys(out.queryParams)).toHaveLength(0);
+  });
+
+  it('puts apiKey in query when scheme is apiKey in query', () => {
+    const auth = {
+      securitySchemes: {
+        apiKey: { type: 'apiKey' as const, in: 'query' as const, name: 'key' },
+      },
+      security: [{ apiKey: [] }],
+    };
+    const out = applyCredential({ apiKey: 'q-secret' }, auth);
+    expect(out.queryParams['key']).toBe('q-secret');
+    expect(Object.keys(out.headers)).toHaveLength(0);
+  });
+
+  it('puts apiKey in Cookie header when scheme is apiKey in cookie', () => {
+    const auth = {
+      securitySchemes: {
+        apiKey: { type: 'apiKey' as const, in: 'cookie' as const, name: 'session' },
+      },
+      security: [{ apiKey: [] }],
+    };
+    const out = applyCredential({ apiKey: 'sess-abc' }, auth);
+    expect(out.headers['Cookie']).toBe('session=sess-abc');
+  });
+
+  it('sets Authorization Bearer when scheme is http bearer', () => {
+    const auth = {
+      securitySchemes: {
+        bearerAuth: { type: 'http' as const, scheme: 'bearer' as const },
+      },
+      security: [{ bearerAuth: [] }],
+    };
+    const out = applyCredential({ bearerAuth: 'token-xyz' }, auth);
+    expect(out.headers['Authorization']).toBe('Bearer token-xyz');
+  });
+
+  it('sets Authorization Basic when scheme is http basic', () => {
+    const auth = {
+      securitySchemes: {
+        basicAuth: { type: 'http' as const, scheme: 'basic' as const },
+      },
+      security: [{ basicAuth: [] }],
+    };
+    const out = applyCredential({ basicAuth: 'alice:secret' }, auth);
+    expect(out.headers['Authorization']).toMatch(/^Basic [A-Za-z0-9+/]+=*$/);
+    const b64 = out.headers['Authorization'].replace(/^Basic /, '');
+    expect(Buffer.from(b64, 'base64').toString('utf8')).toBe('alice:secret');
+  });
+
+  it('normalizes string credential to apiKey', () => {
+    const auth = {
+      securitySchemes: {
+        apiKey: { type: 'apiKey' as const, in: 'header' as const, name: 'Authorization' },
+      },
+      security: [{ apiKey: [] }],
+    };
+    const out = applyCredential('string-token', auth);
+    expect(out.headers['Authorization']).toBe('string-token');
+  });
+
+  it('returns empty when security is empty', () => {
+    const auth = { securitySchemes: { apiKey: { type: 'apiKey' as const, in: 'header' as const, name: 'X-API-Key' } }, security: [] };
+    const out = applyCredential({ apiKey: 'x' }, auth);
+    expect(out.headers).toEqual({});
+    expect(out.queryParams).toEqual({});
+  });
+
+  it('returns empty when credential has no value for required scheme', () => {
+    const auth = {
+      securitySchemes: {
+        apiKey: { type: 'apiKey' as const, in: 'header' as const, name: 'X-API-Key' },
+      },
+      security: [{ apiKey: [] }],
+    };
+    const out = applyCredential({ bearer: 'unused' }, auth);
+    expect(out.headers).toEqual({});
+    expect(out.queryParams).toEqual({});
+  });
+
+  it('uses first required security entry', () => {
+    const auth = {
+      securitySchemes: {
+        apiKey: { type: 'apiKey' as const, in: 'header' as const, name: 'X-API-Key' },
+        bearerAuth: { type: 'http' as const, scheme: 'bearer' as const },
+      },
+      security: [{ apiKey: [] }, { bearerAuth: [] }] as Array<Record<string, string[]>>,
+    };
+    const out = applyCredential({ apiKey: 'first' }, auth);
+    expect(out.headers['X-API-Key']).toBe('first');
+    expect(out.headers['Authorization']).toBeUndefined();
+  });
+});
+
 describe('sendMessage (mocked fetch)', () => {
   const baseUrl = 'https://a2a.example.com';
   const a2aVersion = '0.3';
@@ -209,6 +314,92 @@ describe('sendMessage (mocked fetch)', () => {
 
     await expect(sendMessage({ baseUrl, a2aVersion, content: 'hi' })).rejects.toThrow(
       'A2A request failed: HTTP 500'
+    );
+  });
+
+  it('sends credential as header when auth is apiKey in header', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hello',
+      options: { credential: 'my-api-key' },
+      auth: {
+        securitySchemes: {
+          apiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' },
+        },
+        security: [{ apiKey: [] }],
+      },
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `${baseUrl}/message:send`,
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          'A2A-Version': a2aVersion,
+          'Content-Type': 'application/json',
+          'X-API-Key': 'my-api-key',
+        }),
+      })
+    );
+  });
+
+  it('sends credential as query param when auth is apiKey in query', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hello',
+      options: { credential: { apiKey: 'query-secret' } },
+      auth: {
+        securitySchemes: {
+          apiKey: { type: 'apiKey', in: 'query', name: 'api_key' },
+        },
+        security: [{ apiKey: [] }],
+      },
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `${baseUrl}/message:send?api_key=query-secret`,
+      expect.any(Object)
+    );
+  });
+
+  it('sends Bearer token when auth is http bearer', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hello',
+      options: { credential: { bearerAuth: 'jwt-token-xyz' } },
+      auth: {
+        securitySchemes: {
+          bearerAuth: { type: 'http', scheme: 'bearer' },
+        },
+        security: [{ bearerAuth: [] }],
+      },
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `${baseUrl}/message:send`,
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer jwt-token-xyz',
+        }),
+      })
     );
   });
 });

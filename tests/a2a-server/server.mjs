@@ -7,10 +7,12 @@
  * with valid PAYMENT-SIGNATURE returns 200 (same as x402-server).
  *
  * Env:
- *   PORT           - port (default 4030)
- *   RESPOND_WITH   - "message" (default) or "task" for first message:send
- *   A2A_402        - "1" to enable 402 on /message:send
- *   ACCEPTS_JSON   - JSON array of accept options (when A2A_402=1)
+ *   PORT             - port (default 4030)
+ *   RESPOND_WITH     - "message" (default) or "task" for first message:send
+ *   A2A_402          - "1" to enable 402 on /message:send
+ *   ACCEPTS_JSON     - JSON array of accept options (when A2A_402=1)
+ *   A2A_AUTH         - "1" to require X-API-Key on /message:send and GET /tasks/*
+ *   A2A_EXPECTED_KEY - expected API key value when A2A_AUTH=1 (default "test-secret")
  *
  * Run: node tests/a2a-server/server.mjs
  */
@@ -20,6 +22,8 @@ import http from 'http';
 const PORT = parseInt(process.env.PORT || '4030', 10);
 const RESPOND_WITH = process.env.RESPOND_WITH || 'message';
 const A2A_402 = process.env.A2A_402 === '1';
+const A2A_AUTH = process.env.A2A_AUTH === '1';
+const A2A_EXPECTED_KEY = process.env.A2A_EXPECTED_KEY || 'test-secret';
 
 const DEFAULT_ACCEPTS = [
   {
@@ -89,8 +93,28 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
 
+    // GET /.well-known/agent-card.json (for crawler when A2A_AUTH=1)
+    if (req.method === 'GET' && (pathname === '/.well-known/agent-card.json' || pathname.endsWith('/.well-known/agent-card.json'))) {
+      const agentCard = {
+        name: 'A2A Test Server',
+        securitySchemes: {
+          apiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' },
+        },
+        security: [{ apiKey: [] }],
+      };
+      return send(res, 200, agentCard);
+    }
+
+    function checkAuth() {
+      if (!A2A_AUTH) return true;
+      const key = req.headers['x-api-key'];
+      return key === A2A_EXPECTED_KEY;
+    }
+
     // POST /message:send
     if (req.method === 'POST' && pathname === '/message:send') {
+      if (!checkAuth()) return send(res, 401, { error: 'Missing or invalid X-API-Key' });
+
       const body = await parseBody(req);
       const paymentSig = req.headers['payment-signature'];
       const payload = A2A_402 && paymentSig ? parsePaymentSignature(paymentSig) : null;
@@ -131,6 +155,7 @@ const server = http.createServer(async (req, res) => {
 
     // GET /tasks/:id
     if (req.method === 'GET' && pathname.startsWith('/tasks/') && !pathname.endsWith(':cancel')) {
+      if (!checkAuth()) return send(res, 401, { error: 'Missing or invalid X-API-Key' });
       const taskId = getTaskIdFromPath(pathname, false);
       if (!taskId) return send(res, 404, { error: 'not found' });
       return send(res, 200, {
@@ -145,6 +170,7 @@ const server = http.createServer(async (req, res) => {
 
     // POST /tasks/:id:cancel
     if (req.method === 'POST' && pathname.includes(':cancel')) {
+      if (!checkAuth()) return send(res, 401, { error: 'Missing or invalid X-API-Key' });
       const taskId = getTaskIdFromPath(pathname, true);
       if (!taskId) return send(res, 404, { error: 'not found' });
       return send(res, 200, {

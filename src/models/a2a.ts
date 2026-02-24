@@ -2,11 +2,45 @@
  * A2A (Agent-to-Agent) types per docs/sdk-messaging-tasks-x402-spec.md §2 and §5.
  */
 
-/** Options for messageA2A (blocking, contextId, taskId; credential and payment in later phases). */
+/** Credential as object; string is normalized to { apiKey: string }. */
+export interface CredentialObject {
+  apiKey?: string;
+  bearer?: string;
+  [key: string]: unknown;
+}
+
+/** Options for messageA2A (blocking, contextId, taskId, credential per §2.1, §2.5). */
 export interface MessageA2AOptions {
   blocking?: boolean;
   contextId?: string;
   taskId?: string;
+  /** When the agent's endpoint requires auth: string (→ apiKey) or object (e.g. { apiKey } or { bearer }). */
+  credential?: string | CredentialObject;
+}
+
+/** OpenAPI-style apiKey scheme: where to send the value and under what name. */
+export interface SecuritySchemeApiKey {
+  type: 'apiKey';
+  in: 'header' | 'query' | 'cookie';
+  name: string;
+  description?: string;
+}
+
+/** OpenAPI-style http (Bearer) scheme. */
+export interface SecuritySchemeHttp {
+  type: 'http';
+  scheme: 'bearer' | 'basic';
+  bearerFormat?: string;
+  description?: string;
+}
+
+/** Supported A2A security scheme types (per spec §2.5). */
+export type SecurityScheme = SecuritySchemeApiKey | SecuritySchemeHttp;
+
+/** AgentCard auth shape: securitySchemes and which are required. */
+export interface AgentCardAuth {
+  securitySchemes?: Record<string, SecurityScheme>;
+  security?: Array<Record<string, string[]>>;
 }
 
 /**

@@ -13,9 +13,12 @@ import type { SDK } from '../src/core/sdk.js';
 
 const INTEGRATION_PORT = 4030;
 const INTEGRATION_402_PORT = 4031;
+const INTEGRATION_AUTH_PORT = 4032;
 const SERVER_PATH = 'tests/a2a-server/server.mjs';
 const BASE_URL = `http://localhost:${INTEGRATION_PORT}`;
 const BASE_URL_402 = `http://localhost:${INTEGRATION_402_PORT}`;
+const BASE_URL_AUTH = `http://localhost:${INTEGRATION_AUTH_PORT}`;
+const AUTH_EXPECTED_KEY = 'test-secret';
 
 let serverProcess: ReturnType<typeof spawn> | null = null;
 
@@ -175,5 +178,76 @@ describeIntegration('A2A integration (server with 402)', () => {
       expect(paid.content).toContain('Echo: hello');
       expect(paid.contextId).toBeDefined();
     }
+  }, 10000);
+});
+
+describeIntegration('A2A integration (server with auth)', () => {
+  let authServerProcess: ReturnType<typeof spawn> | null = null;
+
+  beforeAll(async () => {
+    authServerProcess = spawn('node', [SERVER_PATH], {
+      env: {
+        ...process.env,
+        PORT: String(INTEGRATION_AUTH_PORT),
+        A2A_AUTH: '1',
+        A2A_EXPECTED_KEY: AUTH_EXPECTED_KEY,
+      },
+      stdio: 'pipe',
+    });
+    await waitForServer(BASE_URL_AUTH);
+  }, 15000);
+
+  afterAll(() => {
+    if (authServerProcess) {
+      authServerProcess.kill();
+      authServerProcess = null;
+    }
+  });
+
+  it('setA2A fetches agent card with securitySchemes, messageA2A with credential succeeds', async () => {
+    const regFile: RegistrationFile = {
+      name: 'Auth Test Agent',
+      description: 'Test',
+      endpoints: [],
+      trustModels: [TrustModel.REPUTATION],
+      owners: [],
+      operators: [],
+      active: true,
+      x402support: false,
+      metadata: {},
+      updatedAt: 0,
+    };
+    const stubSdk = {
+      getX402RequestDeps: () => ({
+        fetch: globalThis.fetch,
+        buildPayment: async () => {
+          throw new Error('402 not expected');
+        },
+      }),
+    } as unknown as SDK;
+    const agent = new Agent(stubSdk, regFile);
+    await agent.setA2A(BASE_URL_AUTH, '0.3', true);
+
+    const result = await agent.messageA2A('hello', { credential: AUTH_EXPECTED_KEY });
+
+    expect('x402Required' in result && result.x402Required).toBe(false);
+    expect('task' in result).toBe(false);
+    if (!('task' in result) && !('x402Required' in result)) {
+      expect(result.content).toContain('Echo: hello');
+      expect(result.contextId).toBeDefined();
+    }
+  }, 10000);
+
+  it('messageA2A without credential fails with 401 when server requires auth', async () => {
+    const agent = makeAgentWithA2AEndpoint(BASE_URL_AUTH);
+    (agent as any).registrationFile.endpoints[0].meta = {
+      version: '0.3',
+      securitySchemes: {
+        apiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' },
+      },
+      security: [{ apiKey: [] }],
+    };
+
+    await expect(agent.messageA2A('hello')).rejects.toThrow(/401/);
   }, 10000);
 });

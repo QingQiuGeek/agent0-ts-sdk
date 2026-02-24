@@ -14,6 +14,7 @@ import type {
   Part,
   MessageA2AOptions,
   A2APaymentRequired,
+  AgentCardAuth,
 } from '../models/a2a.js';
 import { sendMessage as sendMessageA2A } from './a2a-client.js';
 import type { AgentId, Address, URI } from '../models/types.js';
@@ -185,9 +186,11 @@ export class Agent {
     if (autoFetch) {
       try {
         const capabilities = await this._endpointCrawler.fetchA2aCapabilities(agentcard);
-        if (capabilities?.a2aSkills) {
-          meta.a2aSkills = capabilities.a2aSkills;
+        if (capabilities?.a2aSkills) meta.a2aSkills = capabilities.a2aSkills;
+        if (capabilities?.securitySchemes && Object.keys(capabilities.securitySchemes).length > 0) {
+          meta.securitySchemes = capabilities.securitySchemes;
         }
+        if (capabilities?.security?.length) meta.security = capabilities.security;
       } catch (error) {
         // Soft fail - continue without capabilities
       }
@@ -235,8 +238,24 @@ export class Agent {
     const baseUrl = this._getA2aBaseUrl();
     const ep = this.registrationFile.endpoints.find((e) => e.type === EndpointType.A2A);
     const a2aVersion = (ep?.meta?.version as string) ?? '0.3';
+    const auth = this._getA2aAuthFromMeta(ep?.meta);
     const x402Deps = this.sdk.getX402RequestDeps?.();
-    return sendMessageA2A({ baseUrl, a2aVersion, content, options }, x402Deps);
+    return sendMessageA2A({ baseUrl, a2aVersion, content, options, auth }, x402Deps);
+  }
+
+  /** Build AgentCardAuth from endpoint meta (securitySchemes + security from crawler). */
+  private _getA2aAuthFromMeta(meta: Record<string, unknown> | undefined): AgentCardAuth | undefined {
+    if (!meta) return undefined;
+    const schemes = meta.securitySchemes;
+    const security = meta.security;
+    const hasSchemes =
+      schemes && typeof schemes === 'object' && !Array.isArray(schemes) && Object.keys(schemes).length > 0;
+    const hasSecurity = Array.isArray(security) && security.length > 0;
+    if (!hasSchemes && !hasSecurity) return undefined;
+    const auth: AgentCardAuth = {};
+    if (hasSchemes) auth.securitySchemes = schemes as AgentCardAuth['securitySchemes'];
+    if (hasSecurity) auth.security = security as AgentCardAuth['security'];
+    return auth;
   }
 
   setENS(name: string, version: string = '1.0'): this {
