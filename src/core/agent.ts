@@ -285,10 +285,14 @@ export class Agent {
   /**
    * Load a task by ID. Returns same AgentTask as response.task (query, message, cancel).
    * When the server requires auth, pass options.credential. May return x402Required (see §2.2, §4).
+   * Optional options.payment sends with first request (spec §4.2).
    */
   async loadTask(
     taskId: string,
-    options?: { credential?: string | import('../models/a2a.js').CredentialObject }
+    options?: {
+      credential?: string | import('../models/a2a.js').CredentialObject;
+      payment?: string;
+    }
   ): Promise<AgentTask | A2APaymentRequired<AgentTask>> {
     const baseUrl = this._getA2aBaseUrl();
     const ep = this.registrationFile.endpoints.find((e) => e.type === EndpointType.A2A);
@@ -298,7 +302,7 @@ export class Agent {
       options?.credential != null && cardAuth ? applyCredential(options.credential, cardAuth) : undefined;
     const x402Deps = this.sdk.getX402RequestDeps?.();
 
-    const result = await getTaskA2A(baseUrl, a2aVersion, taskId, resolvedAuth, x402Deps);
+    const result = await getTaskA2A(baseUrl, a2aVersion, taskId, resolvedAuth, x402Deps, options?.payment);
 
     if ('x402Required' in result && result.x402Required) {
       const original = result as A2APaymentRequired<TaskSummary>;

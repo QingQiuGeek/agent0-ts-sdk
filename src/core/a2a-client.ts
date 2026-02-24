@@ -321,13 +321,15 @@ function toTaskSummary(raw: Record<string, unknown>): TaskSummary {
 /**
  * Fetch a single task by ID (GET /tasks/:id). Used by loadTask to get contextId and build AgentTask.
  * When x402Deps provided, 402 returns x402Required + pay() instead of throwing.
+ * Optional payment sends with first request (spec §4.2).
  */
 export async function getTask(
   baseUrl: string,
   a2aVersion: string,
   taskId: string,
   auth?: A2AAuth,
-  x402Deps?: X402RequestDeps
+  x402Deps?: X402RequestDeps,
+  payment?: string
 ): Promise<TaskSummary | X402RequiredResponse<TaskSummary>> {
   const url = appendQueryParams(`${baseUrl}/tasks/${encodeURIComponent(taskId)}`, auth?.queryParams ?? {});
   if (x402Deps) {
@@ -336,6 +338,7 @@ export async function getTask(
         url,
         method: 'GET',
         headers: a2aHeaders(a2aVersion, auth),
+        payment,
         parseResponse: async (res) => {
           if (!res.ok) throw new Error(`Get task failed: HTTP ${res.status} ${res.statusText}`);
           const data = (await res.json()) as Record<string, unknown>;
@@ -396,6 +399,7 @@ export async function listTasks(
         url: buildListUrl(),
         method: 'GET',
         headers: a2aHeaders(a2aVersion, resolvedAuth),
+        payment: options?.payment,
         parseResponse: async (res) => {
           if (!res.ok) throw new Error(`List tasks failed: HTTP ${res.status} ${res.statusText}`);
           const data = (await res.json()) as Record<string, unknown>;
@@ -484,6 +488,7 @@ export async function sendMessage(
         method: 'POST',
         headers: a2aHeaders(a2aVersion, resolvedAuth),
         body: JSON.stringify(body),
+        payment: options?.payment,
         parseResponse: async (res) => {
           if (!res.ok) throw new Error(`A2A request failed: HTTP ${res.status} ${res.statusText}`);
           const data = (await res.json()) as Record<string, unknown>;

@@ -211,6 +211,18 @@ describeIntegration('A2A integration (server with 402)', () => {
       expect(paid.contextId).toBeDefined();
     }
   }, 10000);
+
+  it('messageA2A with options.payment (valid payload): 200 on first request, no 402', async () => {
+    const agent = makeAgentWithA2AEndpoint(BASE_URL_402, async () => VALID_PAYLOAD_402);
+    const result = await agent.messageA2A('hello', { payment: VALID_PAYLOAD_402 });
+
+    expect('x402Required' in result && result.x402Required).toBe(false);
+    expect('task' in result).toBe(false);
+    if (!('task' in result) && !('x402Required' in result)) {
+      expect(result.content).toContain('Echo: hello');
+      expect(result.contextId).toBeDefined();
+    }
+  }, 10000);
 });
 
 describeIntegration('A2A integration (server with 402 on message and tasks)', () => {

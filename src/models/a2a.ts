@@ -9,13 +9,15 @@ export interface CredentialObject {
   [key: string]: unknown;
 }
 
-/** Options for messageA2A (blocking, contextId, taskId, credential per §2.1, §2.5). */
+/** Options for messageA2A (blocking, contextId, taskId, credential, payment per §2.1, §4.2). */
 export interface MessageA2AOptions {
   blocking?: boolean;
   contextId?: string;
   taskId?: string;
   /** When the agent's endpoint requires auth: string (→ apiKey) or object (e.g. { apiKey } or { bearer }). */
   credential?: string | CredentialObject;
+  /** Optional payment payload (e.g. base64 PAYMENT-SIGNATURE) to send with the first request; if server accepts, 2xx and no 402. */
+  payment?: string;
 }
 
 /** OpenAPI-style apiKey scheme: where to send the value and under what name. */
@@ -105,11 +107,13 @@ export interface TaskSummary {
   [key: string]: unknown;
 }
 
-/** Options for listTasks (filter, historyLength, credential per §2.3). */
+/** Options for listTasks (filter, historyLength, credential, payment per §2.3, §4.2). */
 export interface ListTasksOptions {
   filter?: { contextId?: string; status?: string; [key: string]: unknown };
   historyLength?: number;
   credential?: string | CredentialObject;
+  /** Optional payment payload to send with the first request; if server accepts, 2xx and no 402. */
+  payment?: string;
 }
 
 /**

@@ -511,6 +511,62 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     const secondCall = (fetchSpy.mock.calls[1] as any)[1];
     expect(secondCall.headers['PAYMENT-SIGNATURE']).toBe(validPayload);
   });
+
+  it('options.payment set: first request includes PAYMENT-SIGNATURE, 200 returns message (no 402)', async () => {
+    const prebuiltPayload = 'prebuilt-payment-base64';
+    const messageBody = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
+
+    const x402Deps: X402RequestDeps = {
+      fetch: globalThis.fetch,
+      buildPayment: async () => validPayload,
+    };
+
+    const result = await sendMessage(
+      { baseUrl, a2aVersion, content: 'hi', options: { payment: prebuiltPayload } },
+      x402Deps
+    );
+
+    expect('x402Required' in result).toBe(false);
+    if (!('x402Required' in result) && !('task' in result)) {
+      expect(result.content).toBe('OK');
+      expect(result.contextId).toBe('ctx-1');
+    }
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const firstCall = (fetchSpy.mock.calls[0] as any)[1];
+    expect(firstCall.headers['PAYMENT-SIGNATURE']).toBe(prebuiltPayload);
+  });
+
+  it('options.payment set but server returns 402: same x402 flow with pay()', async () => {
+    const accepts = [{ price: '1000000', token: '0xT', network: '84532', destination: '0xD' }];
+    const messageBody = {
+      message: { content: 'Paid', parts: [{ text: 'Paid' }], contextId: 'ctx-1' },
+    };
+    jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 402, body: { accepts } }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
+
+    const x402Deps: X402RequestDeps = {
+      fetch: globalThis.fetch,
+      buildPayment: async () => validPayload,
+    };
+
+    const result = await sendMessage(
+      { baseUrl, a2aVersion, content: 'hi', options: { payment: 'rejected-payload' } },
+      x402Deps
+    );
+
+    expect('x402Required' in result && result.x402Required).toBe(true);
+    if (!('x402Required' in result) || !result.x402Required) return;
+    const paid = await result.x402Payment.pay();
+    expect('x402Required' in paid).toBe(false);
+    if (!('x402Required' in paid) && !('task' in paid)) expect(paid.content).toBe('Paid');
+  });
 });
 
 describe('listTasks', () => {
@@ -581,6 +637,36 @@ describe('listTasks', () => {
     expect(list[1].taskId).toBe('t2');
     expect((globalThis.fetch as jest.Mock).mock.calls[1][0]).toContain('pageToken=100');
   });
+
+  it('with x402Deps and options.payment: first request has PAYMENT-SIGNATURE, 200 returns list', async () => {
+    const prebuiltPayload = 'list-payment-base64';
+    const tasksBody = {
+      tasks: [
+        { id: 't1', taskId: 't1', contextId: 'ctx-1', status: { state: 'open' } },
+      ],
+    };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: tasksBody }));
+
+    const x402Deps: X402RequestDeps = {
+      fetch: globalThis.fetch,
+      buildPayment: async () => 'never-called',
+    };
+
+    const result = await listTasks(
+      { baseUrl, a2aVersion, options: { payment: prebuiltPayload } },
+      x402Deps
+    );
+
+    expect('x402Required' in result).toBe(false);
+    const list = result as import('../src/models/a2a.js').TaskSummary[];
+    expect(list).toHaveLength(1);
+    expect(list[0].taskId).toBe('t1');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const firstCall = (fetchSpy.mock.calls[0] as any)[1];
+    expect(firstCall.headers['PAYMENT-SIGNATURE']).toBe(prebuiltPayload);
+  });
 });
 
 describe('getTask', () => {
@@ -612,6 +698,37 @@ describe('getTask', () => {
       expect(result.status).toEqual({ state: 'working' });
     }
     expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toBe(`${baseUrl}/tasks/task-123`);
+  });
+
+  it('with x402Deps and payment: first request has PAYMENT-SIGNATURE, 200 returns TaskSummary', async () => {
+    const prebuiltPayload = 'get-task-payment-base64';
+    const taskBody = {
+      id: taskId,
+      taskId,
+      contextId: 'ctx-abc',
+      status: { state: 'open' },
+      messages: [],
+      artifacts: [],
+    };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: taskBody }));
+
+    const x402Deps: X402RequestDeps = {
+      fetch: globalThis.fetch,
+      buildPayment: async () => 'never-called',
+    };
+
+    const result = await getTask(baseUrl, a2aVersion, taskId, undefined, x402Deps, prebuiltPayload);
+
+    expect('x402Required' in result).toBe(false);
+    if (!('x402Required' in result)) {
+      expect(result.taskId).toBe(taskId);
+      expect(result.contextId).toBe('ctx-abc');
+    }
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const firstCall = (fetchSpy.mock.calls[0] as any)[1];
+    expect(firstCall.headers['PAYMENT-SIGNATURE']).toBe(prebuiltPayload);
   });
 });
 
