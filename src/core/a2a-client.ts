@@ -39,8 +39,9 @@ function normalizeCredential(credential: string | CredentialObject): CredentialO
 }
 
 /**
- * Apply credential to request using AgentCard securitySchemes and security.
- * Returns headers and query params to merge into A2A requests. Supported: apiKey (header/query/cookie), http (bearer).
+ * Apply credential to request using AgentCard securitySchemes and security (spec §2.5, OpenAPI 3 style).
+ * Uses the first required scheme in security[]; credential object key must match that scheme name (e.g. apiKey, bearerAuth).
+ * Supported: apiKey (in: header|query|cookie + name), http (bearer → Authorization: Bearer; basic → Authorization: Basic base64(user:password)).
  */
 export function applyCredential(
   credential: string | CredentialObject,

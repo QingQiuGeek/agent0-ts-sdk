@@ -278,7 +278,7 @@ export class EndpointCrawler {
 
   /**
    * Extract securitySchemes and security from AgentCard (OpenAPI 3 style, per spec §2.5).
-   * Supported scheme types: apiKey (in: header|query|cookie, name), http (scheme: bearer).
+   * Supported: apiKey (in: header|query|cookie, name), http (scheme: bearer|basic per OpenAPI 3.0).
    */
   private _extractAgentCardAuth(data: Record<string, unknown>): AgentCardAuth {
     const result: AgentCardAuth = {};
