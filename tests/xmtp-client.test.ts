@@ -5,7 +5,7 @@
 
 import { SDK, Agent } from '../src/index.js';
 import type { RegistrationFile } from '../src/models/interfaces.js';
-import { TrustModel } from '../src/models/enums.js';
+import { EndpointType, TrustModel } from '../src/models/enums.js';
 import {
   XMTPLoadError,
   XMTPAlreadyConnectedError,
@@ -291,5 +291,48 @@ describe('XMTP Phase 3 — Agent messageXMTP / loadXMTPConversation', () => {
     delete (regFile as Partial<RegistrationFile>).walletAddress;
     const agent = new Agent(sdk, regFile);
     await expect(agent.messageXMTP('Hi')).rejects.toThrow(/wallet|registered/);
+  });
+});
+
+describe('Unified agent.message() — A2A first, then XMTP', () => {
+  it('message(content) calls messageA2A when agent has A2A endpoint', async () => {
+    const key = JSON.stringify({ version: 1, walletAddress: '0x1234567890123456789012345678901234567890' });
+    const sdk = new SDK({ chainId: 1, rpcUrl: 'https://eth.llamarpc.com', xmtpInstallationKey: key });
+    const regFile = minimalRegistrationFile('0xabcd000000000000000000000000000000000000');
+    regFile.endpoints = [{ type: EndpointType.A2A, value: 'https://example.com/a2a' }];
+    const agent = new Agent(sdk, regFile);
+    const messageA2ASpy = jest.spyOn(agent, 'messageA2A').mockResolvedValue({ content: 'ok' });
+    const messageXMTPSpy = jest.spyOn(agent, 'messageXMTP').mockResolvedValue();
+
+    await agent.message('Hello');
+
+    expect(messageA2ASpy).toHaveBeenCalledWith('Hello', undefined);
+    expect(messageXMTPSpy).not.toHaveBeenCalled();
+  });
+
+  it('message(content) calls messageXMTP when agent has no A2A endpoint', async () => {
+    const key = JSON.stringify({ version: 1, walletAddress: '0x1234567890123456789012345678901234567890' });
+    const sdk = new SDK({ chainId: 1, rpcUrl: 'https://eth.llamarpc.com', xmtpInstallationKey: key });
+    mockCanMessage.mockResolvedValue(new Map([['0xabcd000000000000000000000000000000000000', true]]));
+    const regFile = minimalRegistrationFile('0xabcd000000000000000000000000000000000000');
+    const agent = new Agent(sdk, regFile);
+    const messageXMTPSpy = jest.spyOn(agent, 'messageXMTP').mockResolvedValue();
+
+    await agent.message('Hi');
+
+    expect(messageXMTPSpy).toHaveBeenCalledWith('Hi');
+  });
+
+  it('message({ parts }) normalizes to string for XMTP path', async () => {
+    const key = JSON.stringify({ version: 1, walletAddress: '0x1234567890123456789012345678901234567890' });
+    const sdk = new SDK({ chainId: 1, rpcUrl: 'https://eth.llamarpc.com', xmtpInstallationKey: key });
+    mockCanMessage.mockResolvedValue(new Map([['0xabcd000000000000000000000000000000000000', true]]));
+    const regFile = minimalRegistrationFile('0xabcd000000000000000000000000000000000000');
+    const agent = new Agent(sdk, regFile);
+    const messageXMTPSpy = jest.spyOn(agent, 'messageXMTP').mockResolvedValue();
+
+    await agent.message({ parts: [{ text: 'hello' }, { text: 'world' }] });
+
+    expect(messageXMTPSpy).toHaveBeenCalledWith('hello world');
   });
 });

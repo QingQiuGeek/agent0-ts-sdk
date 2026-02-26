@@ -239,6 +239,29 @@ export class Agent {
   }
 
   /**
+   * Unified message entry point (spec §1.0). Uses A2A first if the agent has an A2A endpoint,
+   * otherwise XMTP. Returns the same shape as the underlying call (A2A response or void for XMTP).
+   */
+  async message(
+    content: string | { parts: Part[] },
+    options?: MessageA2AOptions
+  ): Promise<
+    | MessageResponse
+    | TaskResponse
+    | A2APaymentRequired<MessageResponse | TaskResponse>
+    | void
+  > {
+    if (this.a2aEndpoint) {
+      return this.messageA2A(content, options);
+    }
+    const text =
+      typeof content === 'string'
+        ? content
+        : (content.parts?.map((p) => p.text).filter(Boolean).join(' ') ?? '');
+    return this.messageXMTP(text);
+  }
+
+  /**
    * Send a message to the agent's A2A endpoint. Returns either a direct MessageResponse
    * or a TaskResponse when the server creates a task. On HTTP 402, returns x402Required
    * and x402Payment.pay() to pay and retry (per spec §2.1, §4).

@@ -100,9 +100,10 @@ async function main() {
   await agentBob.messageXMTP('Hello agent, from Alice via Agent');
   const convToAgent = await agentBob.loadXMTPConversation();
   await convToAgent.message('Second message to agent');
+  await agentBob.message('Unified message via agent.message()');
   const histToAgent = await convToAgent.history({ limit: 10 });
   ok(histToAgent.length >= 1, 'agent conversation has messages');
-  ok(histToAgent.some((m) => m.content?.includes('Hello agent') || m.content?.includes('Second message to agent')), 'Alice sees messages to agent');
+  ok(histToAgent.some((m) => m.content?.includes('Hello agent') || m.content?.includes('Second message to agent') || m.content?.includes('Unified message')), 'Alice sees messages to agent');
   console.log('   OK — messages:', histToAgent.length);
 
   // Allow time for messages to sync before reading inboxes
