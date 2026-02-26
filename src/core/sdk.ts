@@ -34,6 +34,16 @@ import {
 import { requestWithX402, type X402RequestDeps } from './x402-request.js';
 import { buildEvmPayment } from './x402-payment.js';
 import type { X402RequestOptions, X402RequestResult } from './x402-types.js';
+import type { XMTPInstallationKey } from '../models/xmtp.js';
+import type { XMTPInboxInfo } from '../models/xmtp.js';
+import {
+  loadXMTPInboxFromKey,
+  registerXMTPInboxWithSigner,
+  getXMTPInboxInfoFromState,
+  type XMTPClientWrapperState,
+  type XmtpClientOptions,
+} from './xmtp-client.js';
+import { XMTPAlreadyConnectedError } from './xmtp-errors.js';
 
 export interface SDKConfig {
   chainId: ChainId;
@@ -59,6 +69,14 @@ export interface SDKConfig {
   // Subgraph configuration
   subgraphUrl?: string;
   subgraphOverrides?: Record<ChainId, string>;
+  /**
+   * Optional XMTP installation key. When set, loadXMTPInbox(key) is called at init or on first XMTP use.
+   */
+  xmtpInstallationKey?: XMTPInstallationKey;
+  /**
+   * XMTP network environment (default: 'dev').
+   */
+  xmtpEnv?: XmtpClientOptions['env'];
 }
 
 /**
@@ -74,6 +92,9 @@ export class SDK {
   private readonly _chainId: ChainId;
   private readonly _subgraphUrls: Record<ChainId, string> = {};
   private readonly _hasSignerConfig: boolean;
+  private _xmtpState?: XMTPClientWrapperState;
+  private readonly _xmtpInstallationKeyFromConfig?: XMTPInstallationKey;
+  private readonly _xmtpEnv?: XmtpClientOptions['env'];
 
   constructor(config: SDKConfig) {
     this._chainId = config.chainId;
@@ -134,6 +155,9 @@ export class SDK {
       (chainId) => this.getSubgraphClient(chainId),
       this._chainId
     );
+
+    this._xmtpInstallationKeyFromConfig = config.xmtpInstallationKey;
+    this._xmtpEnv = config.xmtpEnv;
   }
 
   /**
@@ -756,6 +780,52 @@ export class SDK {
       fetch: globalThis.fetch,
       buildPayment: (accept, snapshot) => buildEvmPayment(accept, this._chainClient, snapshot),
     };
+  }
+
+  // XMTP inbox lifecycle (spec §3)
+
+  /**
+   * Load XMTP inbox from an installation key (or from config key if omitted).
+   * Same key while connected = no-op; different key = switch to new inbox.
+   */
+  async loadXMTPInbox(installationKey?: XMTPInstallationKey): Promise<void> {
+    const key = installationKey ?? this._xmtpInstallationKeyFromConfig;
+    if (!key) {
+      throw new Error('No XMTP installation key provided and none set in config');
+    }
+    if (this._xmtpState?.installationKey === key) {
+      return;
+    }
+    const state = await loadXMTPInboxFromKey(key, { env: this._xmtpEnv });
+    this._xmtpState = state;
+  }
+
+  /**
+   * Register a new XMTP inbox (SDK generates installation key). No parameters.
+   * Throws if already connected, or no wallet, or max installations.
+   */
+  async registerXMTPInbox(): Promise<XMTPInstallationKey> {
+    if (this._xmtpState) {
+      throw new XMTPAlreadyConnectedError();
+    }
+    const state = await registerXMTPInboxWithSigner(this._chainClient, { env: this._xmtpEnv });
+    this._xmtpState = state;
+    return state.installationKey;
+  }
+
+  /**
+   * Return the installation key for the current XMTP client, or undefined if none loaded.
+   */
+  getXMTPInstallationKey(): XMTPInstallationKey | undefined {
+    return this._xmtpState?.installationKey;
+  }
+
+  /**
+   * Return inbox info for the loaded XMTP client, or undefined when none.
+   */
+  getXMTPInboxInfo(): XMTPInboxInfo | undefined {
+    if (!this._xmtpState) return undefined;
+    return getXMTPInboxInfoFromState(this._xmtpState);
   }
 
   // Expose clients for advanced usage
