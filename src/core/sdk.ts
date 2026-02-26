@@ -917,6 +917,7 @@ export class SDK {
     const dm = await client.conversations.createDmWithIdentifier(toIdentifier(peerAddress));
     return {
       history: async (options?: { limit?: number; before?: string }): Promise<XMTPMessage[]> => {
+        await dm.sync();
         const msgs = await dm.messages({ limit: options?.limit });
         return msgs.map((m) => ({
           id: m.id,
