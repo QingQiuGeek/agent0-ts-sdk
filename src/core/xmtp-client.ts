@@ -39,7 +39,12 @@ export async function ensurePeerCanMessage(
 ): Promise<void> {
   const identifier = toIdentifier(peerAddress);
   const map = await client.canMessage([identifier]);
-  const can = map.get(peerAddress) ?? map.get(identifier.identifier) ?? false;
+  const key = peerAddress.toLowerCase();
+  const can =
+    map.get(peerAddress) ??
+    map.get(identifier.identifier) ??
+    map.get(key) ??
+    false;
   if (!can) {
     throw new XMTPReceiverNotRegisteredError();
   }
@@ -162,8 +167,10 @@ export async function registerXMTPInboxWithSigner(
     return { client, installationKey };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (/max.*installation|installation.*limit|too many/i.test(msg)) {
-      throw new XMTPMaxInstallationsError();
+    // Only treat as max installations when the message clearly refers to installation limit
+    // (avoid matching e.g. "too many requests" rate limit)
+    if (/max(imum)?\s*(number\s*of\s*)?installation|installation\s*(limit|maximum|reached)/i.test(msg)) {
+      throw new XMTPMaxInstallationsError(msg);
     }
     throw e;
   }

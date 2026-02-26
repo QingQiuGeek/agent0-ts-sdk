@@ -331,9 +331,10 @@ export class ViemChainClient implements ChainClient {
     if (!this.walletClient) {
       throw new Error('No signer available. Configure walletProvider (browser) or privateKey (server).');
     }
-    const account = (this.account?.address ?? (await this.ensureAddress())) as unknown as ViemAddress;
+    // Pass full account when we have one so viem signs locally (no RPC). Otherwise pass address for wallet-provider path.
+    const accountParam = this.account ?? ((await this.ensureAddress()) as unknown as ViemAddress);
     const sig = (await (this.walletClient as any).signMessage({
-      account,
+      account: accountParam,
       message: typeof message === 'string' ? message : { raw: message },
     })) as Hex;
     return normalizeEcdsaSignature(sig) as `0x${string}`;
@@ -348,9 +349,9 @@ export class ViemChainClient implements ChainClient {
     if (!this.walletClient) {
       throw new Error('No signer available. Configure walletProvider (browser) or privateKey (server).');
     }
-    const account = (this.account?.address ?? (await this.ensureAddress())) as unknown as ViemAddress;
+    const accountParam = this.account ?? ((await this.ensureAddress()) as unknown as ViemAddress);
     const sig = (await (this.walletClient as any).signTypedData({
-      account,
+      account: accountParam,
       domain: args.domain as any,
       types: args.types as any,
       primaryType: args.primaryType as any,
