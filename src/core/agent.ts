@@ -229,7 +229,13 @@ export class Agent {
     if (!endpoint) throw new Error('Agent has no A2A endpoint');
     try {
       const u = new URL(endpoint);
-      u.pathname = '';
+      let pathname = u.pathname;
+      // Strip only agent-card path suffix so path prefixes (e.g. /v1, /v2) are preserved.
+      if (pathname.endsWith('/.well-known/agent-card.json') || pathname.endsWith('agent-card.json')) {
+        pathname = pathname.replace(/\/(\.well-known\/)?agent-card\.json$/i, '') || '/';
+      }
+      if (!pathname || pathname === '/') pathname = '';
+      u.pathname = pathname;
       u.search = '';
       u.hash = '';
       return u.toString().replace(/\/$/, '');
