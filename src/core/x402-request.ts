@@ -5,7 +5,7 @@
  */
 
 import type { X402Accept, X402Payment, X402RequestOptions, X402RequiredResponse, X402RequestResult } from './x402-types.js';
-import { parse402Accepts } from './x402-types.js';
+import { parse402AcceptsFromHeader } from './x402-types.js';
 
 /** Snapshot of the original request so pay() can retry the same request with PAYMENT-SIGNATURE. */
 export interface RequestSnapshot {
@@ -63,14 +63,10 @@ export async function requestWithX402<T = Response>(
   let response = await doFetch(firstPayload);
 
   if (response.status === 402) {
-    let bodyJson: unknown;
-    try {
-      const text = await response.text();
-      bodyJson = text ? JSON.parse(text) : {};
-    } catch {
-      bodyJson = {};
-    }
-    const accepts = parse402Accepts(bodyJson);
+    // x402 spec: payment options only in PAYMENT-REQUIRED header (base64 JSON).
+    const headerPayload =
+      response.headers.get('payment-required') ?? response.headers.get('PAYMENT-REQUIRED');
+    const accepts = parse402AcceptsFromHeader(headerPayload);
     const singleAccept = accepts.length === 1 ? accepts[0]! : undefined;
 
     const x402Payment: X402Payment<T> = {

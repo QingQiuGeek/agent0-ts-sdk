@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 /**
  * Minimal x402 test server for integration tests.
- * - Without PAYMENT-SIGNATURE: returns 402 with configurable accepts.
+ * x402 spec: payment options in PAYMENT-REQUIRED header (base64 JSON), not body.
+ * - Without PAYMENT-SIGNATURE: returns 402 with PAYMENT-REQUIRED header.
  * - With valid PAYMENT-SIGNATURE: returns 200 and optional PAYMENT-RESPONSE header.
  *
  * Env:
  *   PORT          - port (default 4020)
  *   ACCEPTS_JSON  - JSON array of accept options (default: single Base Sepolia USDC-style accept)
- *
- * Run: node tests/x402-server/server.mjs
- * Or:  PORT=4021 ACCEPTS_JSON='[{"price":"1000000","token":"0xT","network":"84532","destination":"0xD"}]' node tests/x402-server/server.mjs
  */
 
 import http from 'http';
@@ -63,8 +61,15 @@ const server = http.createServer((req, res) => {
   }
 
   const accepts = getAccepts();
-  res.writeHead(402, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ accepts }));
+  const paymentRequired = Buffer.from(
+    JSON.stringify({ x402Version: 2, error: 'Payment required', accepts }),
+    'utf8'
+  ).toString('base64');
+  res.writeHead(402, {
+    'Content-Type': 'application/json',
+    'PAYMENT-REQUIRED': paymentRequired,
+  });
+  res.end(JSON.stringify({}));
 });
 
 server.listen(PORT, () => {

@@ -12,6 +12,8 @@ import {
   applyCredential,
   listTasks,
   getTask,
+  baseUrlFromEndpoint,
+  resolveBaseUrl,
 } from '../src/core/a2a-client.js';
 import type { X402RequestDeps } from '../src/core/x402-request.js';
 import type { RegistrationFile } from '../src/models/interfaces.js';
@@ -19,16 +21,27 @@ import { EndpointType, TrustModel } from '../src/models/enums.js';
 import { Agent } from '../src/core/agent.js';
 import type { SDK } from '../src/core/sdk.js';
 
-function mockResponse(init: { status: number; body?: unknown; ok?: boolean }): Response {
+function mockResponse(init: {
+  status: number;
+  body?: unknown;
+  ok?: boolean;
+  /** For 402: x402 spec uses PAYMENT-REQUIRED header (base64 JSON). Pass { accepts } to set it. */
+  paymentRequired?: { accepts: unknown[] };
+}): Response {
   const bodyStr = init.body !== undefined ? JSON.stringify(init.body) : '';
   const ok = init.ok ?? (init.status >= 200 && init.status < 300);
+  const headers = new Headers();
+  if (init.status === 402 && init.paymentRequired) {
+    const b64 = Buffer.from(JSON.stringify(init.paymentRequired), 'utf8').toString('base64');
+    headers.set('payment-required', b64);
+  }
   return {
     ok,
     status: init.status,
     statusText: ok ? 'OK' : 'Error',
     text: () => Promise.resolve(bodyStr),
     json: () => Promise.resolve(init.body ?? {}),
-    headers: new Headers(),
+    headers,
     redirected: false,
     type: 'basic',
     url: '',
@@ -44,7 +57,7 @@ function mockResponse(init: { status: number; body?: unknown; ok?: boolean }): R
 }
 
 function stubCreateTaskHandle(
-  _baseUrl: string,
+  _endpoint: string,
   _a2aVersion: string,
   taskId: string,
   contextId: string
@@ -57,6 +70,41 @@ function stubCreateTaskHandle(
     cancel: async () => ({ taskId, contextId, status: undefined }),
   };
 }
+
+describe('baseUrlFromEndpoint / resolveBaseUrl', () => {
+  it('baseUrlFromEndpoint strips agent-card path', () => {
+    expect(baseUrlFromEndpoint('https://x.com/.well-known/agent-card.json')).toBe('https://x.com');
+    expect(baseUrlFromEndpoint('https://x.com/agents/meerkat/agent-card.json')).toBe('https://x.com/agents/meerkat');
+  });
+
+  it('baseUrlFromEndpoint leaves non-card URLs as-is (origin only for root path)', () => {
+    expect(baseUrlFromEndpoint('https://x.com/')).toBe('https://x.com');
+    expect(baseUrlFromEndpoint('https://x.com/api')).toBe('https://x.com/api');
+  });
+
+  it('resolveBaseUrl uses card url when endpoint is agent-card URL', async () => {
+    const cardUrl = 'https://agent.example.com/.well-known/agent-card.json';
+    const cardBody = { url: 'https://api.example.com/v1/', name: 'Agent' };
+    jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }));
+    const base = await resolveBaseUrl(cardUrl);
+    expect(base).toBe('https://api.example.com/v1');
+  });
+
+  it('resolveBaseUrl falls back to strip when card has no url', async () => {
+    const cardUrl = 'https://agent.example.com/.well-known/agent-card.json';
+    jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: {} }));
+    const base = await resolveBaseUrl(cardUrl);
+    expect(base).toBe('https://agent.example.com');
+  });
+
+  it('resolveBaseUrl does not fetch when endpoint is not agent-card path', async () => {
+    const fetchSpy = jest.spyOn(globalThis, 'fetch');
+    fetchSpy.mockClear();
+    const base = await resolveBaseUrl('https://api.example.com/');
+    expect(base).toBe('https://api.example.com');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
 
 describe('parseMessageSendResponse', () => {
   const baseUrl = 'https://a2a.example.com';
@@ -304,7 +352,7 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     const result = await sendMessage({
-      baseUrl,
+      endpoint: baseUrl,
       a2aVersion,
       content: 'hello',
     });
@@ -316,7 +364,9 @@ describe('sendMessage (mocked fetch)', () => {
         headers: expect.objectContaining({ 'A2A-Version': a2aVersion, 'Content-Type': 'application/json' }),
       })
     );
-    const callBody = JSON.parse((fetchSpy.mock.calls[0] as any)[1].body);
+    const postCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes('message:send'));
+    expect(postCall).toBeDefined();
+    const callBody = JSON.parse((postCall as any)[1].body);
     expect(callBody.message.role).toBe('ROLE_USER');
     expect(callBody.message.parts).toEqual([{ text: 'hello' }]);
     expect(callBody.message.messageId).toBeDefined();
@@ -336,7 +386,7 @@ describe('sendMessage (mocked fetch)', () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     const result = await sendMessage({
-      baseUrl,
+      endpoint: baseUrl,
       a2aVersion,
       content: { parts: [{ text: 'analyze' }, { url: 'https://example.com' }] },
       options: { blocking: true, contextId: 'ctx-0' },
@@ -359,14 +409,14 @@ describe('sendMessage (mocked fetch)', () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 402, body: { accepts: [] } }));
 
     await expect(
-      sendMessage({ baseUrl, a2aVersion, content: 'hi' })
+      sendMessage({ endpoint: baseUrl, a2aVersion, content: 'hi' })
     ).rejects.toThrow('402 Payment Required');
   });
 
   it('throws on non-ok status', async () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 500, body: {} }));
 
-    await expect(sendMessage({ baseUrl, a2aVersion, content: 'hi' })).rejects.toThrow(
+    await expect(sendMessage({ endpoint: baseUrl, a2aVersion, content: 'hi' })).rejects.toThrow(
       'A2A request failed: HTTP 500'
     );
   });
@@ -378,7 +428,7 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     await sendMessage({
-      baseUrl,
+      endpoint: baseUrl,
       a2aVersion,
       content: 'hello',
       options: { credential: 'my-api-key' },
@@ -410,7 +460,7 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     await sendMessage({
-      baseUrl,
+      endpoint: baseUrl,
       a2aVersion,
       content: 'hello',
       options: { credential: { apiKey: 'query-secret' } },
@@ -435,7 +485,7 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     await sendMessage({
-      baseUrl,
+      endpoint: baseUrl,
       a2aVersion,
       content: 'hello',
       options: { credential: { bearerAuth: 'jwt-token-xyz' } },
@@ -484,7 +534,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
     const fetchSpy = jest
       .spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(mockResponse({ status: 402, body: { accepts } }))
+      .mockResolvedValueOnce(mockResponse({ status: 402, paymentRequired: { accepts } }))
       .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
 
     const x402Deps: X402RequestDeps = {
@@ -493,7 +543,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
 
     const result = await sendMessage(
-      { baseUrl, a2aVersion, content: 'hi' },
+      { endpoint: baseUrl, a2aVersion, content: 'hi' },
       x402Deps
     );
 
@@ -527,7 +577,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
 
     const result = await sendMessage(
-      { baseUrl, a2aVersion, content: 'hi', options: { payment: prebuiltPayload } },
+      { endpoint: baseUrl, a2aVersion, content: 'hi', options: { payment: prebuiltPayload } },
       x402Deps
     );
 
@@ -548,7 +598,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
     jest
       .spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(mockResponse({ status: 402, body: { accepts } }))
+      .mockResolvedValueOnce(mockResponse({ status: 402, paymentRequired: { accepts } }))
       .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
 
     const x402Deps: X402RequestDeps = {
@@ -557,7 +607,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
 
     const result = await sendMessage(
-      { baseUrl, a2aVersion, content: 'hi', options: { payment: 'rejected-payload' } },
+      { endpoint: baseUrl, a2aVersion, content: 'hi', options: { payment: 'rejected-payload' } },
       x402Deps
     );
 
@@ -586,7 +636,7 @@ describe('listTasks', () => {
     };
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: tasksBody }));
 
-    const result = await listTasks({ baseUrl, a2aVersion });
+    const result = await listTasks({ endpoint: baseUrl, a2aVersion });
 
     expect(Array.isArray(result)).toBe(true);
     const list = result as import('../src/models/a2a.js').TaskSummary[];
@@ -602,7 +652,7 @@ describe('listTasks', () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: { tasks: [] } }));
 
     await listTasks({
-      baseUrl,
+      endpoint: baseUrl,
       a2aVersion,
       options: { filter: { contextId: 'ctx-x', status: 'open' }, historyLength: 5 },
     });
@@ -629,7 +679,7 @@ describe('listTasks', () => {
         })
       );
 
-    const result = await listTasks({ baseUrl, a2aVersion });
+    const result = await listTasks({ endpoint: baseUrl, a2aVersion });
 
     const list = result as import('../src/models/a2a.js').TaskSummary[];
     expect(list).toHaveLength(2);
@@ -655,7 +705,7 @@ describe('listTasks', () => {
     };
 
     const result = await listTasks(
-      { baseUrl, a2aVersion, options: { payment: prebuiltPayload } },
+      { endpoint: baseUrl, a2aVersion, options: { payment: prebuiltPayload } },
       x402Deps
     );
 
@@ -886,17 +936,22 @@ describe('Agent.messageA2A', () => {
   it('resolves base URL from agent card URL and delegates to sendMessage', async () => {
     const agentCardUrl = 'https://a2a.example.com/.well-known/agent-card.json';
     const baseUrl = 'https://a2a.example.com';
-    const body = {
+    const cardBody = { url: baseUrl + '/', name: 'Test Agent' };
+    const messageBody = {
       message: {
         content: 'OK',
         contextId: 'c1',
       },
     };
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
 
     const agent = makeAgentWithA2A(agentCardUrl);
     const result = await agent.messageA2A('ping');
 
+    expect(fetchSpy).toHaveBeenNthCalledWith(1, agentCardUrl, expect.any(Object));
     expect(fetchSpy).toHaveBeenCalledWith(
       `${baseUrl}/message:send`,
       expect.objectContaining({

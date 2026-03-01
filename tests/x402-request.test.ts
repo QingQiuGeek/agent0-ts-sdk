@@ -3,7 +3,7 @@
  * Commit 1: smoke tests. Commit 2: full handler coverage with mocked fetch + buildPayment.
  */
 
-import { SDK, isX402Required, parse402Accepts } from '../src/index';
+import { SDK, isX402Required } from '../src/index';
 import { requestWithX402 } from '../src/core/x402-request.js';
 
 const BASE_URL = 'https://example.com/api';
@@ -392,39 +392,3 @@ describe('x402 request handler (requestWithX402)', () => {
   });
 });
 
-describe('parse402Accepts', () => {
-  it('parses flat accepts', () => {
-    const out = parse402Accepts({ accepts: [{ price: '100', token: '0xT', network: '8453' }] });
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ price: '100', token: '0xT', network: '8453' });
-  });
-
-  it('parses paymentRequirements shape', () => {
-    const out = parse402Accepts({ paymentRequirements: { amount: '200', asset: '0xA', payTo: '0xD' } });
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ price: '200', token: '0xA', destination: '0xD' });
-  });
-
-  it('parses description and maxAmountRequired from accept entry', () => {
-    const body = {
-      accepts: [
-        { price: '100', token: '0xT', network: '1', description: 'Pay in ETH', maxAmountRequired: '200' },
-      ],
-    };
-    const out = parse402Accepts(body);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({
-      price: '100',
-      token: '0xT',
-      network: '1',
-      description: 'Pay in ETH',
-      maxAmountRequired: '200',
-    });
-  });
-
-  it('returns [] for null or non-object', () => {
-    expect(parse402Accepts(null)).toEqual([]);
-    expect(parse402Accepts(undefined)).toEqual([]);
-    expect(parse402Accepts('string')).toEqual([]);
-  });
-});

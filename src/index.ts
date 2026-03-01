@@ -36,7 +36,7 @@ export type {
   X402RequiredResponse,
   X402RequestResult,
 } from './core/x402-types.js';
-export { isX402Required, parse402Accepts } from './core/x402-types.js';
+export { isX402Required, parse402AcceptsFromHeader } from './core/x402-types.js';
 
 // XMTP errors (spec §3)
 export {

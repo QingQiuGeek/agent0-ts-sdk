@@ -9,6 +9,16 @@
  * Or:       npm run test:a2a-anvil
  */
 
+// Jest cannot load ESM-only @xmtp/node-sdk; mock it so SDK loads (tests only use A2A/402).
+jest.mock('@xmtp/node-sdk', () => ({
+  Client: {
+    build: jest.fn().mockResolvedValue({}),
+    create: jest.fn().mockResolvedValue({}),
+    fetchInboxStates: jest.fn().mockResolvedValue([]),
+  },
+  isText: (m: { content?: unknown }) => typeof m?.content === 'string',
+}));
+
 import { spawn } from 'child_process';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';

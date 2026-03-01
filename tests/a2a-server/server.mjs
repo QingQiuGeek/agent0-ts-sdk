@@ -91,6 +91,19 @@ function send(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+/** x402 spec: 402 responses use PAYMENT-REQUIRED header (base64 JSON), not body. */
+function send402(res, accepts) {
+  const payload = Buffer.from(
+    JSON.stringify({ x402Version: 2, error: 'Payment required', accepts }),
+    'utf8'
+  ).toString('base64');
+  res.writeHead(402, {
+    'Content-Type': 'application/json',
+    'PAYMENT-REQUIRED': payload,
+  });
+  res.end(JSON.stringify({}));
+}
+
 // In-memory task store for GET /tasks (list). Pushed when POST /message:send returns a task.
 const taskStore = [];
 
@@ -131,8 +144,7 @@ const server = http.createServer(async (req, res) => {
       const payload = A2A_402 && paymentSig ? parsePaymentSignature(paymentSig) : null;
 
       if (A2A_402 && !payload) {
-        const accepts = getAccepts();
-        return send(res, 402, { accepts });
+        return send402(res, getAccepts());
       }
 
       const message = body.message || {};
@@ -176,7 +188,7 @@ const server = http.createServer(async (req, res) => {
     // GET /tasks (list) — optional contextId, status, pageSize, pageToken
     if (req.method === 'GET' && pathname === '/tasks') {
       if (!checkAuth()) return send(res, 401, { error: 'Missing or invalid X-API-Key' });
-      if (checkTask402(req)) return send(res, 402, { accepts: getAccepts() });
+      if (checkTask402(req)) return send402(res, getAccepts());
       const contextId = url.searchParams.get('contextId');
       const status = url.searchParams.get('status');
       const pageSize = Math.min(parseInt(url.searchParams.get('pageSize') || '100', 10), 100);
@@ -194,7 +206,7 @@ const server = http.createServer(async (req, res) => {
     // GET /tasks/:id
     if (req.method === 'GET' && pathname.startsWith('/tasks/') && !pathname.endsWith(':cancel')) {
       if (!checkAuth()) return send(res, 401, { error: 'Missing or invalid X-API-Key' });
-      if (checkTask402(req)) return send(res, 402, { accepts: getAccepts() });
+      if (checkTask402(req)) return send402(res, getAccepts());
       const taskId = getTaskIdFromPath(pathname, false);
       if (!taskId) return send(res, 404, { error: 'not found' });
       const stored = taskStore.find((t) => t.id === taskId || t.taskId === taskId);
@@ -214,7 +226,7 @@ const server = http.createServer(async (req, res) => {
     // POST /tasks/:id:cancel
     if (req.method === 'POST' && pathname.includes(':cancel')) {
       if (!checkAuth()) return send(res, 401, { error: 'Missing or invalid X-API-Key' });
-      if (checkTask402(req)) return send(res, 402, { accepts: getAccepts() });
+      if (checkTask402(req)) return send402(res, getAccepts());
       const taskId = getTaskIdFromPath(pathname, true);
       if (!taskId) return send(res, 404, { error: 'not found' });
       const stored = taskStore.find((t) => t.id === taskId || t.taskId === taskId);

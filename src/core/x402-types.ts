@@ -4,7 +4,7 @@
  */
 
 /**
- * A single payment option from a 402 response (or normalized from server body).
+ * A single payment option from a 402 response (PAYMENT-REQUIRED header).
  * Each entry has at least price and token; optional fields for network, scheme, etc.
  */
 export interface X402Accept {
@@ -86,15 +86,8 @@ export function isX402Required<T>(result: X402RequestResult<T>): result is X402R
   return typeof result === 'object' && result !== null && 'x402Required' in result && (result as X402RequiredResponse<T>).x402Required === true;
 }
 
-/** Raw 402 body shape (server may use paymentRequirements or flat accepts). */
-interface Raw402Body {
-  accepts?: Array<Record<string, unknown>>;
-  paymentRequirements?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
 /**
- * Normalize a single raw accept entry (flat or under paymentRequirements) to X402Accept.
+ * Normalize a single accept entry from PAYMENT-REQUIRED header (amount/asset/payTo → price/token/destination).
  */
 function normalizeAcceptEntry(entry: Record<string, unknown>): X402Accept {
   const pr = (entry.paymentRequirements as Record<string, unknown> | undefined) || entry;
@@ -114,22 +107,28 @@ function normalizeAcceptEntry(entry: Record<string, unknown>): X402Accept {
   };
 }
 
-/**
- * Parse 402 response body into X402Accept[].
- * Tolerates common shapes: { accepts: [...] }, { accepts: [{ paymentRequirements: {...} }] }, or malformed (returns []).
- */
-export function parse402Accepts(body: unknown): X402Accept[] {
-  if (body == null || typeof body !== 'object') return [];
-  const raw = body as Raw402Body;
-  let list = raw.accepts;
-  if (!Array.isArray(list)) {
-    if (raw.paymentRequirements && typeof raw.paymentRequirements === 'object') {
-      list = [raw.paymentRequirements as Record<string, unknown>];
-    } else {
-      return [];
-    }
+function decodeBase64(b64: string): string {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(b64, 'base64').toString('utf8');
   }
-  return list
-    .filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
-    .map(normalizeAcceptEntry);
+  return atob(b64);
+}
+
+/**
+ * Parse PAYMENT-REQUIRED header (x402 spec: base64-encoded JSON with accepts array).
+ * Server sends payment options in header; body may be empty. Returns [] if header missing/invalid.
+ */
+export function parse402AcceptsFromHeader(headerValue: string | null): X402Accept[] {
+  if (!headerValue || typeof headerValue !== 'string') return [];
+  try {
+    const json = JSON.parse(decodeBase64(headerValue.trim()));
+    if (json == null || typeof json !== 'object') return [];
+    const list = json.accepts;
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
+      .map(normalizeAcceptEntry);
+  } catch {
+    return [];
+  }
 }
