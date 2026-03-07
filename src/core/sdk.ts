@@ -958,14 +958,19 @@ export class SDK {
     const dm = await client.conversations.createDmWithIdentifier(toIdentifier(peerAddress));
     return {
       history: async (options?: { limit?: number; before?: string }): Promise<XMTPMessage[]> => {
+        // Sync client conversations first so new DMs and messages are discoverable, then sync this conversation
+        await client.conversations.sync();
         await dm.sync();
         const msgs = await dm.messages({ limit: options?.limit });
-        return msgs.map((m) => ({
-          id: m.id,
-          content: isText(m) ? (m.content as string) : ((m as { fallback?: string }).fallback ?? String(m.content ?? '')),
-          senderInboxId: m.senderInboxId,
-          sentAt: m.sentAt,
-        }));
+        // Only include text messages; XMTP also emits conversation metadata (e.g. conversation created) which isText() is false for
+        return msgs
+          .filter((m) => isText(m))
+          .map((m) => ({
+            id: m.id,
+            content: m.content as string,
+            senderInboxId: m.senderInboxId,
+            sentAt: m.sentAt,
+          }));
       },
       message: async (content: string) => {
         await dm.sendText(content);
