@@ -12,9 +12,10 @@ import {
   applyCredential,
   listTasks,
   getTask,
-  baseUrlFromEndpoint,
-  resolveBaseUrl,
+  normalizeInterfaces,
+  pickInterface,
 } from '../src/core/a2a-client.js';
+import type { NormalizedInterface } from '../src/core/a2a-client.js';
 import type { X402RequestDeps } from '../src/core/x402-request.js';
 import type { RegistrationFile } from '../src/models/interfaces.js';
 import { EndpointType, TrustModel } from '../src/models/enums.js';
@@ -71,38 +72,144 @@ function stubCreateTaskHandle(
   };
 }
 
-describe('baseUrlFromEndpoint / resolveBaseUrl', () => {
-  it('baseUrlFromEndpoint strips agent-card path', () => {
-    expect(baseUrlFromEndpoint('https://x.com/.well-known/agent-card.json')).toBe('https://x.com');
-    expect(baseUrlFromEndpoint('https://x.com/agents/meerkat/agent-card.json')).toBe('https://x.com/agents/meerkat');
+describe('normalizeInterfaces', () => {
+  it('returns empty array for null, undefined, or non-object card', () => {
+    expect(normalizeInterfaces(null)).toEqual([]);
+    expect(normalizeInterfaces(undefined)).toEqual([]);
+    expect(normalizeInterfaces('not an object' as unknown as Record<string, unknown>)).toEqual([]);
   });
 
-  it('baseUrlFromEndpoint leaves non-card URLs as-is (origin only for root path)', () => {
-    expect(baseUrlFromEndpoint('https://x.com/')).toBe('https://x.com');
-    expect(baseUrlFromEndpoint('https://x.com/api')).toBe('https://x.com/api');
+  it('normalizes v1 supportedInterfaces with url, protocolBinding, protocolVersion, tenant', () => {
+    const card = {
+      supportedInterfaces: [
+        {
+          url: 'https://api.example.com/a2a/',
+          protocolBinding: 'HTTP+JSON',
+          protocolVersion: '0.3',
+          tenant: 'org-1',
+        },
+      ],
+    };
+    const result = normalizeInterfaces(card as Record<string, unknown>);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      url: 'https://api.example.com/a2a',
+      binding: 'HTTP+JSON',
+      version: '0.3',
+      tenant: 'org-1',
+    });
   });
 
-  it('resolveBaseUrl uses card url when endpoint is agent-card URL', async () => {
-    const cardUrl = 'https://agent.example.com/.well-known/agent-card.json';
-    const cardBody = { url: 'https://api.example.com/v1/', name: 'Agent' };
-    jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }));
-    const base = await resolveBaseUrl(cardUrl);
-    expect(base).toBe('https://api.example.com/v1');
+  it('normalizes protocolBinding variants to JSONRPC and GRPC', () => {
+    const card = {
+      supportedInterfaces: [
+        { url: 'https://a.com', protocolBinding: 'JSON-RPC' },
+        { url: 'https://b.com', protocol: 'grpc' },
+      ],
+    };
+    const result = normalizeInterfaces(card as Record<string, unknown>);
+    expect(result[0].binding).toBe('JSONRPC');
+    expect(result[1].binding).toBe('GRPC');
   });
 
-  it('resolveBaseUrl falls back to strip when card has no url', async () => {
-    const cardUrl = 'https://agent.example.com/.well-known/agent-card.json';
-    jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: {} }));
-    const base = await resolveBaseUrl(cardUrl);
-    expect(base).toBe('https://agent.example.com');
+  it('treats missing or unknown protocolBinding as AUTO', () => {
+    const card = {
+      supportedInterfaces: [
+        { url: 'https://a.com' },
+        { url: 'https://b.com', protocolBinding: 'unknown' },
+      ],
+    };
+    const result = normalizeInterfaces(card as Record<string, unknown>);
+    expect(result[0].binding).toBe('AUTO');
+    expect(result[1].binding).toBe('AUTO');
   });
 
-  it('resolveBaseUrl does not fetch when endpoint is not agent-card path', async () => {
-    const fetchSpy = jest.spyOn(globalThis, 'fetch');
-    fetchSpy.mockClear();
-    const base = await resolveBaseUrl('https://api.example.com/');
-    expect(base).toBe('https://api.example.com');
-    expect(fetchSpy).not.toHaveBeenCalled();
+  it('skips entries without valid http(s) URL', () => {
+    const card = {
+      supportedInterfaces: [
+        { url: '' },
+        { url: 'ftp://x.com' },
+        { url: 'https://valid.com/' },
+      ],
+    };
+    const result = normalizeInterfaces(card as Record<string, unknown>);
+    expect(result).toHaveLength(1);
+    expect(result[0].url).toBe('https://valid.com');
+  });
+
+  it('normalizes 0.3-style card with url, preferredTransport, additionalInterfaces', () => {
+    const card = {
+      url: 'https://base.example.com',
+      preferredTransport: 'HTTP+JSON',
+      protocolVersion: '0.3',
+      additionalInterfaces: [
+        { url: 'https://alt.example.com', transport: 'JSONRPC', tenant: 't2' },
+      ],
+    };
+    const result = normalizeInterfaces(card as Record<string, unknown>);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({ url: 'https://base.example.com', binding: 'HTTP+JSON', version: '0.3' });
+    expect(result[1]).toMatchObject({ url: 'https://alt.example.com', binding: 'JSONRPC', tenant: 't2' });
+  });
+});
+
+describe('pickInterface', () => {
+  it('returns null for empty list', () => {
+    expect(pickInterface([], ['HTTP+JSON', 'JSONRPC'])).toBeNull();
+  });
+
+  it('picks single matching interface', () => {
+    const ifaces: NormalizedInterface[] = [
+      { url: 'https://a.com', binding: 'HTTP+JSON', version: '0.3' },
+    ];
+    expect(pickInterface(ifaces, ['HTTP+JSON', 'JSONRPC'])).toEqual(ifaces[0]);
+  });
+
+  it('prefers HTTP+JSON over JSONRPC when both present (order in list after version/AUTO sort)', () => {
+    const ifaces: NormalizedInterface[] = [
+      { url: 'https://httpjson.com', binding: 'HTTP+JSON', version: '0.3' },
+      { url: 'https://jsonrpc.com', binding: 'JSONRPC', version: '0.3' },
+    ];
+    const picked = pickInterface(ifaces, ['HTTP+JSON', 'JSONRPC']);
+    expect(picked?.url).toBe('https://httpjson.com');
+    expect(picked?.binding).toBe('HTTP+JSON');
+  });
+
+  it('allows AUTO and places it after others in version tie-break', () => {
+    const ifaces: NormalizedInterface[] = [
+      { url: 'https://auto.com', binding: 'AUTO', version: '0.3' },
+      { url: 'https://httpjson.com', binding: 'HTTP+JSON', version: '0.3' },
+    ];
+    const picked = pickInterface(ifaces, ['HTTP+JSON', 'JSONRPC']);
+    expect(picked?.binding).toBe('HTTP+JSON');
+    expect(picked?.url).toBe('https://httpjson.com');
+  });
+
+  it('prefers higher version when binding tie-break', () => {
+    const ifaces: NormalizedInterface[] = [
+      { url: 'https://old.com', binding: 'HTTP+JSON', version: '0.3' },
+      { url: 'https://new.com', binding: 'HTTP+JSON', version: '1.0' },
+    ];
+    const picked = pickInterface(ifaces, ['HTTP+JSON']);
+    expect(picked?.version).toBe('1.0');
+    expect(picked?.url).toBe('https://new.com');
+  });
+
+  it('respects custom preferredBindings (allowed set; first in list with same version wins)', () => {
+    const ifaces: NormalizedInterface[] = [
+      { url: 'https://jsonrpc.com', binding: 'JSONRPC', version: '0.3' },
+      { url: 'https://httpjson.com', binding: 'HTTP+JSON', version: '0.3' },
+    ];
+    const picked = pickInterface(ifaces, ['JSONRPC', 'HTTP+JSON']);
+    expect(picked?.binding).toBe('JSONRPC');
+    expect(picked?.url).toBe('https://jsonrpc.com');
+  });
+
+  it('returns null when no interface matches allowed bindings', () => {
+    const ifaces: NormalizedInterface[] = [
+      { url: 'https://grpc.com', binding: 'GRPC', version: '0.3' },
+    ];
+    expect(pickInterface(ifaces, ['HTTP+JSON', 'JSONRPC'])).toBeNull();
   });
 });
 
@@ -352,13 +459,13 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     const result = await sendMessage({
-      endpoint: baseUrl,
+      baseUrl,
       a2aVersion,
       content: 'hello',
     });
 
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/message:send`,
+      `${baseUrl}/v1/message:send`,
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({ 'A2A-Version': a2aVersion, 'Content-Type': 'application/json' }),
@@ -386,7 +493,7 @@ describe('sendMessage (mocked fetch)', () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     const result = await sendMessage({
-      endpoint: baseUrl,
+      baseUrl,
       a2aVersion,
       content: { parts: [{ text: 'analyze' }, { url: 'https://example.com' }] },
       options: { blocking: true, contextId: 'ctx-0' },
@@ -409,14 +516,14 @@ describe('sendMessage (mocked fetch)', () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 402, body: { accepts: [] } }));
 
     await expect(
-      sendMessage({ endpoint: baseUrl, a2aVersion, content: 'hi' })
+      sendMessage({ baseUrl, a2aVersion, content: 'hi' })
     ).rejects.toThrow('402 Payment Required');
   });
 
   it('throws on non-ok status', async () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 500, body: {} }));
 
-    await expect(sendMessage({ endpoint: baseUrl, a2aVersion, content: 'hi' })).rejects.toThrow(
+    await expect(sendMessage({ baseUrl, a2aVersion, content: 'hi' })).rejects.toThrow(
       'A2A request failed: HTTP 500'
     );
   });
@@ -428,7 +535,7 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     await sendMessage({
-      endpoint: baseUrl,
+      baseUrl,
       a2aVersion,
       content: 'hello',
       options: { credential: 'my-api-key' },
@@ -441,7 +548,7 @@ describe('sendMessage (mocked fetch)', () => {
     });
 
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/message:send`,
+      `${baseUrl}/v1/message:send`,
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({
@@ -460,7 +567,7 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     await sendMessage({
-      endpoint: baseUrl,
+      baseUrl,
       a2aVersion,
       content: 'hello',
       options: { credential: { apiKey: 'query-secret' } },
@@ -473,7 +580,7 @@ describe('sendMessage (mocked fetch)', () => {
     });
 
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/message:send?api_key=query-secret`,
+      `${baseUrl}/v1/message:send?api_key=query-secret`,
       expect.any(Object)
     );
   });
@@ -485,7 +592,7 @@ describe('sendMessage (mocked fetch)', () => {
     const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     await sendMessage({
-      endpoint: baseUrl,
+      baseUrl,
       a2aVersion,
       content: 'hello',
       options: { credential: { bearerAuth: 'jwt-token-xyz' } },
@@ -498,12 +605,122 @@ describe('sendMessage (mocked fetch)', () => {
     });
 
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/message:send`,
+      `${baseUrl}/v1/message:send`,
       expect.objectContaining({
         headers: expect.objectContaining({
           Authorization: 'Bearer jwt-token-xyz',
         }),
       })
+    );
+  });
+
+  it('with binding HTTP+JSON uses /v1/message:send for version 0.3', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hi',
+      binding: 'HTTP+JSON',
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `${baseUrl}/v1/message:send`,
+      expect.objectContaining({ method: 'POST' })
+    );
+  });
+
+  it('with binding JSONRPC POSTs to baseUrl with JSON-RPC body (0.3 method message/send)', async () => {
+    const body = { result: { message: { content: 'Echo', parts: [{ text: 'Echo' }], contextId: 'c1' } } };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hi',
+      binding: 'JSONRPC',
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      baseUrl.replace(/\/+$/, ''),
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.any(String),
+      })
+    );
+    const callBody = JSON.parse((fetchSpy.mock.calls[0] as any)[1].body);
+    expect(callBody.jsonrpc).toBe('2.0');
+    expect(callBody.method).toBe('message/send');
+    expect(callBody.params?.message).toBeDefined();
+  });
+
+  it('with binding AUTO tries HTTP+JSON first then JSON-RPC on 404', async () => {
+    const messagePayload = {
+      message: {
+        content: 'From JSON-RPC',
+        parts: [{ text: 'From JSON-RPC' }],
+        contextId: 'c1',
+      },
+    };
+    const jsonRpcBody = { result: messagePayload };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 404, body: {} }))
+      .mockResolvedValueOnce(mockResponse({ status: 404, body: {} }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: jsonRpcBody }));
+
+    const result = await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hi',
+      binding: 'AUTO',
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    expect((fetchSpy.mock.calls[0] as any)[0]).toContain('/v1/message:send');
+    expect((fetchSpy.mock.calls[1] as any)[0]).toContain('message:send');
+    expect((fetchSpy.mock.calls[2] as any)[1].body).toMatch(/"method":"message\/send"/);
+    expect('task' in result).toBe(false);
+    if (!('task' in result) && !('x402Required' in result)) expect(result.content).toBe('From JSON-RPC');
+  });
+
+  it('with binding AUTO uses HTTP+JSON when first path returns 200', async () => {
+    const body = {
+      message: { content: 'Direct', parts: [{ text: 'Direct' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    const result = await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hi',
+      binding: 'AUTO',
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect((fetchSpy.mock.calls[0] as any)[0]).toContain('/v1/message:send');
+    if (!('task' in result) && !('x402Required' in result)) expect(result.content).toBe('Direct');
+  });
+
+  it('with tenant passes tenant prefix in path', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await sendMessage({
+      baseUrl,
+      a2aVersion,
+      content: 'hi',
+      tenant: 'tenant-alpha',
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `${baseUrl}/tenants/tenant-alpha/v1/message:send`,
+      expect.any(Object)
     );
   });
 });
@@ -543,7 +760,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
 
     const result = await sendMessage(
-      { endpoint: baseUrl, a2aVersion, content: 'hi' },
+      { baseUrl, a2aVersion, content: 'hi' },
       x402Deps
     );
 
@@ -577,7 +794,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
 
     const result = await sendMessage(
-      { endpoint: baseUrl, a2aVersion, content: 'hi', options: { payment: prebuiltPayload } },
+      { baseUrl, a2aVersion, content: 'hi', options: { payment: prebuiltPayload } },
       x402Deps
     );
 
@@ -607,7 +824,7 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     };
 
     const result = await sendMessage(
-      { endpoint: baseUrl, a2aVersion, content: 'hi', options: { payment: 'rejected-payload' } },
+      { baseUrl, a2aVersion, content: 'hi', options: { payment: 'rejected-payload' } },
       x402Deps
     );
 
@@ -616,6 +833,100 @@ describe('sendMessage with x402Deps (402 then pay())', () => {
     const paid = await result.x402Payment.pay();
     expect('x402Required' in paid).toBe(false);
     if (!('x402Required' in paid) && !('task' in paid)) expect(paid.content).toBe('Paid');
+  });
+});
+
+describe('postAndParseMessageSend', () => {
+  const baseUrl = 'https://a2a.example.com';
+  const a2aVersion = '0.3';
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('tries /v1/message:send first for version 0.3, then /message:send on 404', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 404, body: {} }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    const result = await postAndParseMessageSend(
+      baseUrl,
+      a2aVersion,
+      { message: { role: 'ROLE_USER', parts: [{ text: 'hi' }], messageId: 'm1' } },
+      stubCreateTaskHandle,
+      undefined,
+      undefined
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect((fetchSpy.mock.calls[0] as any)[0]).toBe(`${baseUrl.replace(/\/+$/, '')}/v1/message:send`);
+    expect((fetchSpy.mock.calls[1] as any)[0]).toBe(`${baseUrl.replace(/\/+$/, '')}/message:send`);
+    expect('task' in result).toBe(false);
+    if (!('task' in result)) expect(result.content).toBe('OK');
+  });
+
+  it('for version 1.0 tries /message:send first', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await postAndParseMessageSend(
+      baseUrl,
+      '1.0',
+      { message: { role: 'ROLE_USER', parts: [{ text: 'hi' }], messageId: 'm1' } },
+      stubCreateTaskHandle,
+      undefined,
+      undefined
+    );
+
+    expect((fetchSpy.mock.calls[0] as any)[0]).toContain('/message:send');
+    expect((fetchSpy.mock.calls[0] as any)[0]).not.toContain('/v1/');
+  });
+
+  it('includes tenant prefix in path when tenant provided', async () => {
+    const body = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId: 'ctx-1' },
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+
+    await postAndParseMessageSend(
+      baseUrl,
+      a2aVersion,
+      { message: { role: 'ROLE_USER', parts: [{ text: 'hi' }], messageId: 'm1' } },
+      stubCreateTaskHandle,
+      undefined,
+      'my-tenant'
+    );
+
+    expect((fetchSpy.mock.calls[0] as any)[0]).toContain('/tenants/my-tenant/v1/message:send');
+  });
+
+  it('throws clear error when response body is not JSON (e.g. HTML)', async () => {
+    const htmlResponse = {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: () => Promise.resolve('<html><body>Not JSON</body></html>'),
+      headers: new Headers(),
+      url: `${baseUrl}/v1/message:send`,
+    } as unknown as Response;
+    jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(htmlResponse);
+
+    await expect(
+      postAndParseMessageSend(
+        baseUrl,
+        a2aVersion,
+        { message: { role: 'ROLE_USER', parts: [{ text: 'hi' }], messageId: 'm1' } },
+        stubCreateTaskHandle,
+        undefined,
+        undefined
+      )
+    ).rejects.toThrow(/non-JSON|HTML|wrong URL/);
   });
 });
 
@@ -636,7 +947,7 @@ describe('listTasks', () => {
     };
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: tasksBody }));
 
-    const result = await listTasks({ endpoint: baseUrl, a2aVersion });
+    const result = await listTasks({ baseUrl, a2aVersion });
 
     expect(Array.isArray(result)).toBe(true);
     const list = result as import('../src/models/a2a.js').TaskSummary[];
@@ -652,7 +963,7 @@ describe('listTasks', () => {
     jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: { tasks: [] } }));
 
     await listTasks({
-      endpoint: baseUrl,
+      baseUrl,
       a2aVersion,
       options: { filter: { contextId: 'ctx-x', status: 'open' }, historyLength: 5 },
     });
@@ -679,7 +990,7 @@ describe('listTasks', () => {
         })
       );
 
-    const result = await listTasks({ endpoint: baseUrl, a2aVersion });
+    const result = await listTasks({ baseUrl, a2aVersion });
 
     const list = result as import('../src/models/a2a.js').TaskSummary[];
     expect(list).toHaveLength(2);
@@ -705,7 +1016,7 @@ describe('listTasks', () => {
     };
 
     const result = await listTasks(
-      { endpoint: baseUrl, a2aVersion, options: { payment: prebuiltPayload } },
+      { baseUrl, a2aVersion, options: { payment: prebuiltPayload } },
       x402Deps
     );
 
@@ -716,6 +1027,15 @@ describe('listTasks', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     const firstCall = (fetchSpy.mock.calls[0] as any)[1];
     expect(firstCall.headers['PAYMENT-SIGNATURE']).toBe(prebuiltPayload);
+  });
+
+  it('with tenant uses /tenants/:tenant/v1/tasks in URL', async () => {
+    jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: { tasks: [] } }));
+
+    await listTasks({ baseUrl, a2aVersion, tenant: 'org-42' });
+
+    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0];
+    expect(url).toContain('/tenants/org-42/v1/tasks');
   });
 });
 
@@ -747,7 +1067,7 @@ describe('getTask', () => {
       expect(result.contextId).toBe('ctx-abc');
       expect(result.status).toEqual({ state: 'working' });
     }
-    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toBe(`${baseUrl}/tasks/task-123`);
+    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toBe(`${baseUrl}/v1/tasks/task-123`);
   });
 
   it('with x402Deps and payment: first request has PAYMENT-SIGNATURE, 200 returns TaskSummary', async () => {
@@ -780,6 +1100,22 @@ describe('getTask', () => {
     const firstCall = (fetchSpy.mock.calls[0] as any)[1];
     expect(firstCall.headers['PAYMENT-SIGNATURE']).toBe(prebuiltPayload);
   });
+
+  it('with tenant uses /tenants/:tenant/v1/tasks/:id in URL', async () => {
+    const taskBody = {
+      id: taskId,
+      taskId,
+      contextId: 'ctx-abc',
+      status: { state: 'open' },
+      messages: [],
+      artifacts: [],
+    };
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: taskBody }));
+
+    await getTask(baseUrl, a2aVersion, taskId, undefined, undefined, undefined, 'tenant-99');
+
+    expect((fetchSpy.mock.calls[0] as any)[0]).toContain('/tenants/tenant-99/v1/tasks/task-123');
+  });
 });
 
 describe('createTaskHandle', () => {
@@ -806,7 +1142,7 @@ describe('createTaskHandle', () => {
     const result = await task.query({ historyLength: 10 });
 
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/tasks/task-abc?historyLength=10`,
+      `${baseUrl}/v1/tasks/task-abc?historyLength=10`,
       expect.objectContaining({ method: 'GET', headers: expect.objectContaining({ 'A2A-Version': a2aVersion }) })
     );
     expect('x402Required' in result).toBe(false);
@@ -833,7 +1169,7 @@ describe('createTaskHandle', () => {
     const result = await task.message('follow up');
 
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/message:send`,
+      `${baseUrl}/v1/message:send`,
       expect.objectContaining({
         method: 'POST',
         body: expect.any(String),
@@ -876,7 +1212,7 @@ describe('createTaskHandle', () => {
     const result = await task.cancel();
 
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/tasks/task-abc:cancel`,
+      `${baseUrl}/v1/tasks/task-abc:cancel`,
       expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ 'A2A-Version': a2aVersion }) })
     );
     expect('x402Required' in result).toBe(false);
@@ -885,6 +1221,30 @@ describe('createTaskHandle', () => {
       expect(result.contextId).toBe(contextId);
       expect(result.status).toEqual({ state: 'canceled' });
     }
+  });
+
+  it('with tenant: task.query() and task.message() use /tenants/:tenant prefix', async () => {
+    const taskData = {
+      id: taskId,
+      contextId,
+      status: { state: 'working' },
+      artifacts: [],
+      messages: [],
+    };
+    const messageBody = {
+      message: { content: 'OK', parts: [{ text: 'OK' }], contextId },
+    };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: taskData }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
+
+    const task = createTaskHandle(baseUrl, a2aVersion, taskId, contextId, undefined, undefined, 'org-7');
+    await task.query({ historyLength: 5 });
+    await task.message('follow up');
+
+    expect((fetchSpy.mock.calls[0] as any)[0]).toContain('/tenants/org-7/v1/tasks/task-abc');
+    expect((fetchSpy.mock.calls[1] as any)[0]).toContain('/tenants/org-7/v1/message:send');
   });
 });
 
@@ -936,7 +1296,10 @@ describe('Agent.messageA2A', () => {
   it('resolves base URL from agent card URL and delegates to sendMessage', async () => {
     const agentCardUrl = 'https://a2a.example.com/.well-known/agent-card.json';
     const baseUrl = 'https://a2a.example.com';
-    const cardBody = { url: baseUrl + '/', name: 'Test Agent' };
+    const cardBody = {
+      supportedInterfaces: [{ url: baseUrl + '/', protocolBinding: 'HTTP+JSON', protocolVersion: '0.3' }],
+      name: 'Test Agent',
+    };
     const messageBody = {
       message: {
         content: 'OK',
@@ -953,7 +1316,7 @@ describe('Agent.messageA2A', () => {
 
     expect(fetchSpy).toHaveBeenNthCalledWith(1, agentCardUrl, expect.any(Object));
     expect(fetchSpy).toHaveBeenCalledWith(
-      `${baseUrl}/message:send`,
+      `${baseUrl}/v1/message:send`,
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({ 'A2A-Version': '0.3' }),
@@ -968,8 +1331,14 @@ describe('Agent.messageA2A', () => {
   });
 
   it('uses endpoint meta version when set', async () => {
+    const cardBody = {
+      supportedInterfaces: [{ url: 'https://a2a.example.com/', protocolBinding: 'HTTP+JSON', protocolVersion: '0.30' }],
+    };
     const body = { message: { content: 'OK' } };
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body }));
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body }));
 
     const agent = makeAgentWithA2A('https://a2a.example.com/card.json', '0.30');
     await agent.messageA2A('hi');
@@ -983,10 +1352,16 @@ describe('Agent.messageA2A', () => {
   });
 
   it('listTasks GETs /tasks and returns task array', async () => {
+    const cardBody = {
+      supportedInterfaces: [{ url: 'https://a2a.example.com/', protocolBinding: 'HTTP+JSON', protocolVersion: '0.3' }],
+    };
     const tasksBody = {
       tasks: [{ id: 't1', taskId: 't1', contextId: 'ctx-1', status: { state: 'open' } }],
     };
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: tasksBody }));
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: tasksBody }));
 
     const agent = makeAgentWithA2A('https://a2a.example.com');
     const result = await agent.listTasks();
@@ -995,17 +1370,23 @@ describe('Agent.messageA2A', () => {
     const list = result as import('../src/models/a2a.js').TaskSummary[];
     expect(list).toHaveLength(1);
     expect(list[0].taskId).toBe('t1');
-    expect(fetchSpy.mock.calls[0][0]).toContain('https://a2a.example.com/tasks');
+    expect(fetchSpy.mock.calls[1][0]).toContain('https://a2a.example.com/v1/tasks');
   });
 
   it('loadTask GETs /tasks/:id and returns AgentTask', async () => {
+    const cardBody = {
+      supportedInterfaces: [{ url: 'https://a2a.example.com/', protocolBinding: 'HTTP+JSON', protocolVersion: '0.3' }],
+    };
     const taskBody = {
       id: 'task-xyz',
       taskId: 'task-xyz',
       contextId: 'ctx-99',
       status: { state: 'open' },
     };
-    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(mockResponse({ status: 200, body: taskBody }));
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: taskBody }));
 
     const agent = makeAgentWithA2A('https://a2a.example.com');
     const task = await agent.loadTask('task-xyz');
@@ -1018,6 +1399,93 @@ describe('Agent.messageA2A', () => {
       expect(typeof task.message).toBe('function');
       expect(typeof task.cancel).toBe('function');
     }
-    expect(fetchSpy.mock.calls[0][0]).toBe('https://a2a.example.com/tasks/task-xyz');
+    expect(fetchSpy.mock.calls[1][0]).toBe('https://a2a.example.com/v1/tasks/task-xyz');
+  });
+
+  it('when endpoint is base URL (no card path), fetches discovery path .well-known/agent-card.json', async () => {
+    const baseUrl = 'https://a2a.example.com';
+    const cardBody = {
+      supportedInterfaces: [{ url: baseUrl + '/', protocolBinding: 'HTTP+JSON', protocolVersion: '0.3' }],
+    };
+    const messageBody = { message: { content: 'OK', contextId: 'c1' } };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
+
+    const agent = makeAgentWithA2A(baseUrl);
+    await agent.messageA2A('ping');
+
+    expect(fetchSpy).toHaveBeenNthCalledWith(1, `${baseUrl}/.well-known/agent-card.json`, expect.any(Object));
+    expect(fetchSpy.mock.calls[1][0]).toContain(baseUrl);
+    expect(fetchSpy.mock.calls[1][0]).toContain('message:send');
+  });
+
+  it('when discovery agent-card.json returns 404, tries agent.json', async () => {
+    const baseUrl = 'https://a2a.example.com';
+    const cardBody = {
+      supportedInterfaces: [{ url: baseUrl + '/', protocolBinding: 'HTTP+JSON', protocolVersion: '0.3' }],
+    };
+    const messageBody = { message: { content: 'OK', contextId: 'c1' } };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 404, body: {} }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
+
+    const agent = makeAgentWithA2A(baseUrl);
+    await agent.messageA2A('ping');
+
+    expect((fetchSpy.mock.calls[0] as any)[0]).toContain('agent-card.json');
+    expect((fetchSpy.mock.calls[1] as any)[0]).toContain('agent.json');
+    expect((fetchSpy.mock.calls[2] as any)[0]).toContain('message:send');
+  });
+
+  it('caches version and tenant from card and uses them for message and listTasks', async () => {
+    const baseUrl = 'https://a2a.example.com';
+    const cardBody = {
+      supportedInterfaces: [
+        {
+          url: baseUrl + '/',
+          protocolBinding: 'HTTP+JSON',
+          protocolVersion: '0.31',
+          tenant: 'tenant-from-card',
+        },
+      ],
+    };
+    const messageBody = { message: { content: 'OK', contextId: 'c1' } };
+    const tasksBody = { tasks: [{ id: 't1', taskId: 't1', contextId: 'c1', status: {} }] };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: tasksBody }));
+
+    const agent = makeAgentWithA2A('https://a2a.example.com/.well-known/agent-card.json');
+    await agent.messageA2A('hi');
+    await agent.listTasks();
+
+    expect((fetchSpy.mock.calls[1] as any)[0]).toContain('/tenants/tenant-from-card/');
+    expect((fetchSpy.mock.calls[1] as any)[1].headers['A2A-Version']).toBe('0.31');
+    expect((fetchSpy.mock.calls[2] as any)[0]).toContain('/tenants/tenant-from-card/v1/tasks');
+  });
+
+  it('setA2aBaseUrlOverride causes message to use override base URL', async () => {
+    const cardUrl = 'https://a2a.example.com/.well-known/agent-card.json';
+    const cardBody = {
+      supportedInterfaces: [{ url: 'https://a2a.example.com/', protocolBinding: 'HTTP+JSON', protocolVersion: '0.3' }],
+    };
+    const overrideBase = 'https://override.example.com';
+    const messageBody = { message: { content: 'OK', contextId: 'c1' } };
+    const fetchSpy = jest
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: cardBody }))
+      .mockResolvedValueOnce(mockResponse({ status: 200, body: messageBody }));
+
+    const agent = makeAgentWithA2A(cardUrl).setA2aBaseUrlOverride(overrideBase);
+    await agent.messageA2A('ping');
+
+    expect(fetchSpy).toHaveBeenNthCalledWith(1, cardUrl, expect.any(Object));
+    expect((fetchSpy.mock.calls[1] as any)[0]).toMatch(new RegExp(`^${overrideBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   });
 });

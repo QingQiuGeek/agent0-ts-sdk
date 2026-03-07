@@ -117,10 +117,18 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
 
-    // GET /.well-known/agent-card.json (for crawler when A2A_AUTH=1)
+    // GET /.well-known/agent-card.json (discovery + crawler when A2A_AUTH=1)
     if (req.method === 'GET' && (pathname === '/.well-known/agent-card.json' || pathname.endsWith('/.well-known/agent-card.json'))) {
+      const baseUrl = `http://localhost:${PORT}`;
       const agentCard = {
         name: 'A2A Test Server',
+        supportedInterfaces: [
+          {
+            url: baseUrl,
+            protocolBinding: 'HTTP+JSON',
+            protocolVersion: '1.0',
+          },
+        ],
         securitySchemes: {
           apiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' },
         },
