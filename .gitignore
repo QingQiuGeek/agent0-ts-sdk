@@ -41,6 +41,9 @@ tests/.x402-deploy-result.json
 *.tmp
 *.temp
 
+# XMTP example / local DB
+data/
+
 # Package manager locks (uncomment if you want to ignore)
 # package-lock.json
 # yarn.lock
