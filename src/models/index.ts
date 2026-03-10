@@ -7,5 +7,4 @@ export * from './types.js';
 export * from './enums.js';
 export * from './interfaces.js';
 export * from './a2a.js';
-export * from './xmtp.js';
 

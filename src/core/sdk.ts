@@ -34,47 +34,6 @@ import {
 import { requestWithX402, type X402RequestDeps } from './x402-request.js';
 import { buildEvmPayment } from './x402-payment.js';
 import type { X402RequestOptions, X402RequestResult } from './x402-types.js';
-import type {
-  XMTPConversationHandle,
-  XMTPConversationSummary,
-  XMTPInboxInfo,
-  XMTPInstallationKey,
-  XMTPMessage,
-} from '../models/xmtp.js';
-import {
-  loadXMTPInboxFromKey,
-  registerXMTPInboxWithSigner,
-  getXMTPInboxInfoFromState,
-  toIdentifier,
-  ensurePeerCanMessage,
-  readDbFromPath,
-  type XMTPClientWrapperState,
-  type XmtpClientOptions,
-} from './xmtp-client.js';
-import { XMTPAlreadyConnectedError, XMTPWalletRequiredError } from './xmtp-errors.js';
-import { Client as XMTPClient, ConsentState, isText } from '@xmtp/node-sdk';
-
-/** Normalize thrown value to a string (native XMTP errors may not be Error instances). */
-function xmtpErrorMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  if (e && typeof e === 'object') {
-    const o = e as Record<string, unknown>;
-    if (typeof o.message === 'string') return o.message;
-    if (typeof o.toString === 'function') {
-      const s = o.toString();
-      if (s !== '[object Object]') return s;
-    }
-  }
-  return String(e);
-}
-
-/** True when the error is the native "Missing identity update" / "Association error" (e.g. second client on same DB). */
-function isXmtpIdentityError(e: unknown): boolean {
-  const msg = xmtpErrorMessage(e);
-  if (/missing identity|association error/i.test(msg)) return true;
-  if (e && typeof e === 'object' && (e as { code?: string }).code === 'GenericFailure') return true;
-  return false;
-}
 
 export interface SDKConfig {
   chainId: ChainId;
@@ -101,28 +60,6 @@ export interface SDKConfig {
   subgraphUrl?: string;
   subgraphOverrides?: Record<ChainId, string>;
   /**
-   * Optional XMTP installation key. When set, loadXMTPInbox(key) is called at init or on first XMTP use.
-   */
-  xmtpInstallationKey?: XMTPInstallationKey;
-  /**
-   * XMTP network environment (default: 'production').
-   */
-  xmtpEnv?: XmtpClientOptions['env'];
-  /**
-   * Workaround: persist the XMTP client DB so you can restore the same inbox later.
-   * The XMTP Node SDK does not expose key-bundle export (unlike the Dart SDK), so we cannot
-   * "only retrieve the key" and restore with just a key; we must persist the whole DB blob.
-   * On register: use a temp path, read the DB into memory, delete the file; persist the blob
-   * via getXMTPDatabaseBlob() (e.g. D1, env). On load: set xmtpDbBlob and xmtpDbEncryptionKey
-   * to restore. After restore, use XMTPConversations() / loadXMTPConversation() so syncAll/sync
-   * pull conversations and message history from the network. Node only.
-   */
-  xmtpDbEncryptionKey?: XmtpClientOptions['dbEncryptionKey'];
-  /** Optional path for register when using xmtpDbEncryptionKey (default: temp file). */
-  xmtpDbPath?: string;
-  /** Persisted DB blob for load (restore same inbox). Set with xmtpDbEncryptionKey when loading. */
-  xmtpDbBlob?: Uint8Array;
-  /**
    * Optional RPC URLs for other chains when paying x402 on a different chain than `chainId`.
    * Example: { 84532: 'https://base-sepolia.drpc.org' } so pay() can sign for Base Sepolia when the 402 accept is eip155:84532.
    */
@@ -142,12 +79,6 @@ export class SDK {
   private readonly _chainId: ChainId;
   private readonly _subgraphUrls: Record<ChainId, string> = {};
   private readonly _hasSignerConfig: boolean;
-  private _xmtpState?: XMTPClientWrapperState;
-  private readonly _xmtpInstallationKeyFromConfig?: XMTPInstallationKey;
-  private readonly _xmtpEnv?: XmtpClientOptions['env'];
-  private readonly _xmtpDbEncryptionKey?: XmtpClientOptions['dbEncryptionKey'];
-  private readonly _xmtpDbPath?: string;
-  private readonly _xmtpDbBlob?: Uint8Array;
   private readonly _rpcUrls: Record<number, string>;
   private readonly _paymentChainClients = new Map<number, ChainClient>();
   private readonly _signerForPayment: { privateKey?: string; walletProvider?: Eip1193Provider };
@@ -213,12 +144,6 @@ export class SDK {
       (chainId) => this.getSubgraphClient(chainId),
       this._chainId
     );
-
-    this._xmtpInstallationKeyFromConfig = config.xmtpInstallationKey;
-    this._xmtpEnv = config.xmtpEnv;
-    this._xmtpDbEncryptionKey = config.xmtpDbEncryptionKey;
-    this._xmtpDbPath = config.xmtpDbPath;
-    this._xmtpDbBlob = config.xmtpDbBlob;
   }
 
   /**
@@ -871,229 +796,6 @@ export class SDK {
       fetch: globalThis.fetch,
       buildPayment: (accept, snapshot) =>
         buildEvmPayment(accept, this.getChainClientForAccept(accept), snapshot),
-    };
-  }
-
-  // XMTP inbox lifecycle (spec §3)
-
-  /**
-   * Load XMTP inbox from an installation key (or from config key if omitted).
-   * Same key while connected = no-op; different key = switch to new inbox.
-   */
-  async loadXMTPInbox(installationKey?: XMTPInstallationKey): Promise<void> {
-    const key = installationKey ?? this._xmtpInstallationKeyFromConfig;
-    if (!key) {
-      throw new Error('No XMTP installation key provided and none set in config');
-    }
-    if (this._xmtpState?.installationKey === key) {
-      return;
-    }
-    const state = await loadXMTPInboxFromKey(key, {
-      env: this._xmtpEnv,
-      dbPath: this._xmtpDbPath,
-      dbBlob: this._xmtpDbBlob,
-      dbEncryptionKey: this._xmtpDbEncryptionKey,
-    });
-    this._xmtpState = state;
-  }
-
-  /**
-   * Register a new XMTP inbox (SDK generates installation key). No parameters.
-   * Throws if already connected, or no wallet, or max installations.
-   */
-  async registerXMTPInbox(): Promise<XMTPInstallationKey> {
-    if (this._xmtpState) {
-      throw new XMTPAlreadyConnectedError();
-    }
-    const state = await registerXMTPInboxWithSigner(this._chainClient, {
-      env: this._xmtpEnv,
-      dbEncryptionKey: this._xmtpDbEncryptionKey,
-      dbPath: this._xmtpDbPath,
-    });
-    this._xmtpState = state;
-    return state.installationKey;
-  }
-
-  /**
-   * Return the installation key for the current XMTP client, or undefined if none loaded.
-   */
-  getXMTPInstallationKey(): XMTPInstallationKey | undefined {
-    return this._xmtpState?.installationKey;
-  }
-
-  /**
-   * Return the persisted DB blob when using the db workaround (register with xmtpDbEncryptionKey).
-   * Persist this (e.g. to D1 or base64 in env) and pass it back as xmtpDbBlob with xmtpDbEncryptionKey when loading.
-   * Key-only restore is not possible with the current XMTP Node SDK (no key-bundle export); the blob is the full DB snapshot.
-   */
-  getXMTPDatabaseBlob(): Uint8Array | undefined {
-    return this._xmtpState?.dbBlob;
-  }
-
-  /**
-   * Capture the current XMTP DB blob from disk (Node only). Call this after sending messages and syncing
-   * so the snapshot includes identity updates and conversations; then use getXMTPDatabaseBlob() or the
-   * returned blob for restore. Returns undefined if the client was not registered with db path kept (e.g. loaded from blob).
-   */
-  async captureXMTPDatabaseBlob(): Promise<Uint8Array | undefined> {
-    const path = this._xmtpState?.dbPath;
-    if (!path) return undefined;
-    const blob = await readDbFromPath(path);
-    if (this._xmtpState) this._xmtpState.dbBlob = blob;
-    return blob;
-  }
-
-  /**
-   * Return inbox info for the loaded XMTP client, or undefined when none.
-   */
-  getXMTPInboxInfo(): XMTPInboxInfo | undefined {
-    if (!this._xmtpState) return undefined;
-    return getXMTPInboxInfoFromState(this._xmtpState);
-  }
-
-  /**
-   * Ensure an XMTP inbox is loaded: use existing, or load from config key, or auto-register when wallet connected.
-   */
-  private async _ensureXMTPInbox(): Promise<void> {
-    if (this._xmtpState) return;
-    if (this._xmtpInstallationKeyFromConfig) {
-      await this.loadXMTPInbox();
-      return;
-    }
-    const address = await this._chainClient.getAddress();
-    if (!address) {
-      throw new XMTPWalletRequiredError();
-    }
-    await this.registerXMTPInbox();
-  }
-
-  /**
-   * List XMTP conversations (ensure inbox first; auto-register if wallet connected).
-   * If sync fails with "Missing identity update" (e.g. after restore from blob), falls back to listing from local DB only.
-   */
-  async XMTPConversations(): Promise<XMTPConversationSummary[]> {
-    await this._ensureXMTPInbox();
-    const client = this._xmtpState!.client;
-    let list: Awaited<ReturnType<typeof client.conversations.list>>;
-    try {
-      await client.conversations.syncAll([ConsentState.Allowed, ConsentState.Unknown]);
-      await client.conversations.sync();
-      list = await client.conversations.list();
-    } catch (e) {
-      if (!isXmtpIdentityError(e)) throw e;
-      // Second client on same DB or restored-from-blob: sync can fail; try listing from local DB only.
-      try {
-        list = await client.conversations.list();
-      } catch {
-        list = [];
-      }
-    }
-    const summaries: XMTPConversationSummary[] = [];
-    const dmInboxIds: string[] = [];
-    for (const conv of list) {
-      const peerInboxId = (conv as { peerInboxId?: string }).peerInboxId;
-      if (peerInboxId) dmInboxIds.push(peerInboxId);
-    }
-    let peerAddressByInboxId: Map<string, string> = new Map();
-    if (dmInboxIds.length > 0) {
-      try {
-        const states = await XMTPClient.fetchInboxStates(dmInboxIds, this._xmtpEnv);
-        for (const s of states) {
-          const addr = s.recoveryIdentifier?.identifier ?? s.identifiers?.[0]?.identifier;
-          if (addr) peerAddressByInboxId.set(s.inboxId, addr);
-        }
-      } catch (e) {
-        if (!isXmtpIdentityError(e)) throw e;
-        // leave peerAddressByInboxId empty
-      }
-    }
-    for (const conv of list) {
-      const peerInboxId = (conv as { peerInboxId?: string }).peerInboxId;
-      if (peerInboxId) {
-        let lastActivity: Date | undefined;
-        try {
-          const last = await (conv as { lastMessage?: () => Promise<unknown> }).lastMessage?.();
-          if (last && typeof (last as { sentAt?: Date }).sentAt === 'object') {
-            lastActivity = (last as { sentAt: Date }).sentAt;
-          }
-        } catch {
-          // ignore
-        }
-        summaries.push({
-          peerAddress: peerAddressByInboxId.get(peerInboxId),
-          peerInboxId,
-          lastActivity,
-        });
-      }
-    }
-    return summaries;
-  }
-
-  /**
-   * Send a text message to a peer (ensure inbox first; receiver must have registered inbox).
-   */
-  async messageXMTP(peerAddress: string, content: string): Promise<void> {
-    await this._ensureXMTPInbox();
-    const client = this._xmtpState!.client;
-    await ensurePeerCanMessage(client, peerAddress);
-    const dm = await client.conversations.createDmWithIdentifier(toIdentifier(peerAddress));
-    await dm.sendText(content);
-  }
-
-  /**
-   * Load a conversation with a peer (ensure inbox first; peer must have registered inbox).
-   * If the client hits "Missing identity update" (e.g. after restore from blob), returns a handle that reads from local DB only; history may be empty.
-   */
-  async loadXMTPConversation(peerAddress: string): Promise<XMTPConversationHandle> {
-    await this._ensureXMTPInbox();
-    const client = this._xmtpState!.client;
-    let dm: Awaited<ReturnType<typeof client.conversations.createDmWithIdentifier>> | null = null;
-    try {
-      await ensurePeerCanMessage(client, peerAddress);
-      dm = await client.conversations.createDmWithIdentifier(toIdentifier(peerAddress));
-    } catch (e) {
-      if (!isXmtpIdentityError(e)) throw e;
-      try {
-        dm = await client.conversations.createDmWithIdentifier(toIdentifier(peerAddress));
-      } catch {
-        dm = null;
-      }
-    }
-    if (!dm) {
-      return {
-        history: async () => [],
-        message: async () => {
-          throw new Error('Cannot send: client restored from blob and conversation unavailable (Missing identity update).');
-        },
-      };
-    }
-    return {
-      history: async (options?: { limit?: number; before?: string }): Promise<XMTPMessage[]> => {
-        let msgs: Awaited<ReturnType<typeof dm.messages>>;
-        try {
-          await client.conversations.sync();
-          await dm.sync();
-          msgs = await dm.messages({ limit: options?.limit });
-        } catch (e) {
-          if (!isXmtpIdentityError(e)) throw e;
-          try {
-            msgs = await dm.messages({ limit: options?.limit });
-          } catch {
-            msgs = [];
-          }
-        }
-        return msgs
-          .filter((m) => isText(m))
-          .map((m) => ({
-            id: m.id,
-            content: m.content as string,
-            senderInboxId: m.senderInboxId,
-            sentAt: m.sentAt,
-          }));
-      },
-      message: async (content: string) => {
-        await dm.sendText(content);
-      },
     };
   }
 

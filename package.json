@@ -32,8 +32,6 @@
     "a2a-server": "node tests/a2a-server/server.mjs",
     "test:a2a-integration": "RUN_A2A_INTEGRATION=1 jest --testPathPattern=a2a-integration",
     "test:a2a-anvil": "RUN_A2A_ANVIL=1 jest --testPathPattern=a2a-anvil",
-    "test:xmtp-integration": "RUN_XMTP_INTEGRATION=1 jest --testPathPattern=xmtp-integration",
-    "test:xmtp-integration:run": "node scripts/run-xmtp-integration.mjs",
     "forge:build": "forge build",
     "anvil:node": "anvil --port 8545",
     "lint": "eslint src",
@@ -68,7 +66,6 @@
     "access": "public"
   },
   "dependencies": {
-    "@xmtp/node-sdk": "^5.3.0",
     "graphql-request": "^6.1.0",
     "ipfs-http-client": "^60.0.1",
     "viem": "^2.37.5"

@@ -1,6 +1,6 @@
 /**
  * x402-types unit tests: parse402AcceptsFromHeader (PAYMENT-REQUIRED header only; x402 spec).
- * Imports only from x402-types to avoid pulling in SDK/XMTP.
+ * Imports only from x402-types to avoid pulling in the full SDK.
  */
 
 import { parse402AcceptsFromHeader } from '../src/core/x402-types.js';

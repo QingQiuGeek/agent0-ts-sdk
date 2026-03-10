@@ -9,16 +9,6 @@
  * Or:       npm run test:x402-anvil
  */
 
-// Jest cannot load ESM-only @xmtp/node-sdk; mock it so SDK loads (tests only use x402/viem).
-jest.mock('@xmtp/node-sdk', () => ({
-  Client: {
-    build: jest.fn().mockResolvedValue({}),
-    create: jest.fn().mockResolvedValue({}),
-    fetchInboxStates: jest.fn().mockResolvedValue([]),
-  },
-  isText: (m: { content?: unknown }) => typeof m?.content === 'string',
-}));
-
 import { spawn } from 'child_process';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';

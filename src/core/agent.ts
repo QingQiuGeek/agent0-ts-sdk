@@ -29,7 +29,6 @@ import {
   pickInterface,
 } from './a2a-client.js';
 import type { X402Accept } from './x402-types.js';
-import type { XMTPConversationHandle } from '../models/xmtp.js';
 import type { AgentId, Address, URI } from '../models/types.js';
 import { EndpointType, TrustModel } from '../models/enums.js';
 import type { SDK } from './sdk.js';
@@ -123,7 +122,7 @@ export class Agent {
   /**
    * Read the verified agent wallet from the Identity Registry (on-chain).
    * When registrationFile.walletAddress is set (e.g. from discovery or for testing), returns it
-   * without a chain read so agents can be used with a known wallet and XMTP without chain.
+   * without a chain read so agents can be used with a known wallet without chain.
    */
   async getWallet(): Promise<Address | undefined> {
     if (this.registrationFile.walletAddress) {
@@ -339,8 +338,8 @@ export class Agent {
   }
 
   /**
-   * Unified message entry point (spec §1.0). Uses A2A first if the agent has an A2A endpoint,
-   * otherwise XMTP. Returns the same shape as the underlying call (A2A response or void for XMTP).
+   * Unified message entry point (spec §1.0). Sends via A2A when the agent has an A2A endpoint.
+   * Throws if the agent has no A2A endpoint.
    */
   async message(
     content: string | { parts: Part[] },
@@ -349,16 +348,11 @@ export class Agent {
     | MessageResponse
     | TaskResponse
     | A2APaymentRequired<MessageResponse | TaskResponse>
-    | void
   > {
-    if (this.a2aEndpoint) {
-      return this.messageA2A(content, options);
+    if (!this.a2aEndpoint) {
+      throw new Error('Agent has no A2A endpoint; messaging is only supported via A2A.');
     }
-    const text =
-      typeof content === 'string'
-        ? content
-        : (content.parts?.map((p) => p.text).filter(Boolean).join(' ') ?? '');
-    return this.messageXMTP(text);
+    return this.messageA2A(content, options);
   }
 
   /**
@@ -381,32 +375,6 @@ export class Agent {
       { baseUrl, a2aVersion, content, options, auth, tenant: this._cachedA2aTenant, binding },
       x402Deps
     );
-  }
-
-  /**
-   * Send a message from the loaded inbox to this agent's XMTP address.
-   * Resolves the agent's wallet via getWallet() and delegates to sdk.messageXMTP.
-   * Fails if the agent has no wallet set or the agent's wallet has no registered XMTP inbox.
-   */
-  async messageXMTP(content: string): Promise<void> {
-    const agentAddress = await this.getWallet();
-    if (!agentAddress) {
-      throw new Error('Agent has no wallet set; cannot message via XMTP.');
-    }
-    return this.sdk.messageXMTP(agentAddress, content);
-  }
-
-  /**
-   * Get the loaded inbox's conversation with this agent.
-   * Resolves the agent's wallet via getWallet() and delegates to sdk.loadXMTPConversation.
-   * Fails if the agent has no wallet set or the agent's wallet has no registered XMTP inbox.
-   */
-  async loadXMTPConversation(): Promise<XMTPConversationHandle> {
-    const agentAddress = await this.getWallet();
-    if (!agentAddress) {
-      throw new Error('Agent has no wallet set; cannot load XMTP conversation.');
-    }
-    return this.sdk.loadXMTPConversation(agentAddress);
   }
 
   /** Build AgentCardAuth from endpoint meta (securitySchemes + security from crawler). */

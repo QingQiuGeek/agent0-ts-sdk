@@ -12,7 +12,6 @@ export default {
       useESM: true,
     }],
   },
-  setupFiles: ['<rootDir>/tests/setup-xmtp-mock.ts'],
   setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
   collectCoverageFrom: [
     'src/**/*.ts',

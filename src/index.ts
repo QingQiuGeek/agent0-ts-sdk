@@ -38,12 +38,3 @@ export type {
 } from './core/x402-types.js';
 export { isX402Required, parse402AcceptsFromHeader, parse402FromBody, parse402FromWWWAuthenticate } from './core/x402-types.js';
 
-// XMTP errors (spec §3)
-export {
-  XMTPReceiverNotRegisteredError,
-  XMTPMaxInstallationsError,
-  XMTPAlreadyConnectedError,
-  XMTPWalletRequiredError,
-  XMTPLoadError,
-} from './core/xmtp-errors.js';
-
