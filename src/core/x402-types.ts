@@ -83,9 +83,11 @@ export interface X402RequiredResponse<T> {
 export type X402RequestResult<T> = (T & { x402Required?: false }) | X402RequiredResponse<T>;
 
 /**
- * Type guard: result is 402 response.
+ * Type guard: result is 402 response. Returns false for null/undefined.
  */
-export function isX402Required<T>(result: X402RequestResult<T>): result is X402RequiredResponse<T> {
+export function isX402Required<T>(
+  result: X402RequestResult<T> | null | undefined
+): result is X402RequiredResponse<T> {
   return typeof result === 'object' && result !== null && 'x402Required' in result && (result as X402RequiredResponse<T>).x402Required === true;
 }
 

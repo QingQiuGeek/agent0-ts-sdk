@@ -191,7 +191,7 @@ export async function requestWithX402<T = unknown>(
   }
 
   if (response.ok) {
-    return parseResponse(response) as Promise<T>;
+    return parseResponse(response) as Promise<X402RequestResult<T>>;
   }
 
   throw new Error(`HTTP ${response.status}: ${response.statusText}`);
