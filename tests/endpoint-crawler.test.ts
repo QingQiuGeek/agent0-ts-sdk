@@ -54,3 +54,43 @@ describe('Endpoint Crawler with Real Public Servers', () => {
   });
 });
 
+describe('Endpoint Crawler A2A auth extraction (mocked fetch)', () => {
+  it('returns securitySchemes and security from agent card when present', async () => {
+    const agentCardUrl = 'https://a2a-auth.example.com/.well-known/agent-card.json';
+    const agentCard = {
+      name: 'Test Agent',
+      securitySchemes: {
+        apiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' },
+        bearerAuth: { type: 'http', scheme: 'bearer' },
+      },
+      security: [{ apiKey: [] }, { bearerAuth: [] }],
+    };
+
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockImplementation((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url;
+      if (String(url).includes('agent-card') || String(url).endsWith('/.well-known/agent-card.json')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(agentCard), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        );
+      }
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+
+    const crawler = new EndpointCrawler(5000);
+    const capabilities = await crawler.fetchA2aCapabilities(agentCardUrl);
+
+    expect(capabilities).not.toBeNull();
+    expect(capabilities?.securitySchemes).toBeDefined();
+    expect(capabilities?.securitySchemes?.apiKey).toEqual({
+      type: 'apiKey',
+      in: 'header',
+      name: 'X-API-Key',
+    });
+    expect(capabilities?.securitySchemes?.bearerAuth).toEqual({ type: 'http', scheme: 'bearer' });
+    expect(capabilities?.security).toHaveLength(2);
+    expect(capabilities?.security).toEqual([{ apiKey: [] }, { bearerAuth: [] }]);
+
+    fetchSpy.mockRestore();
+  });
+});
+

@@ -4,6 +4,11 @@ node_modules/
 # Build outputs
 dist/
 *.tsbuildinfo
+out/
+
+# Foundry (forge build / anvil)
+cache/
+artifacts/
 
 # Generated files
 src/models/generated/
@@ -30,10 +35,14 @@ npm-debug.log*
 # Testing
 coverage/
 .nyc_output/
+tests/.x402-deploy-result.json
 
 # Temporary files
 *.tmp
 *.temp
+
+# XMTP example / local DB
+data/
 
 # Package manager locks (uncomment if you want to ignore)
 # package-lock.json

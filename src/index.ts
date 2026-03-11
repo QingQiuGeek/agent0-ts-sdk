@@ -13,6 +13,7 @@ export * from './utils/index.js';
 export { SDK } from './core/sdk.js';
 export type { SDKConfig } from './core/sdk.js';
 export { Agent } from './core/agent.js';
+export { A2AClientFromSummary } from './core/a2a-summary-client.js';
 export { ViemChainClient } from './core/viem-chain-client.js';
 export type { ChainClient, TransactionOptions } from './core/chain-client.js';
 export { IPFSClient } from './core/ipfs-client.js';
@@ -27,4 +28,24 @@ export type { TransactionMined, TransactionWaitOptions } from './core/transactio
 
 // Export contract definitions
 export * from './core/contracts.js';
+
+// x402 payment-required types and helpers
+export type {
+  X402Accept,
+  X402Payment,
+  X402RequestOptions,
+  X402RequiredResponse,
+  X402RequestResult,
+  ResourceInfo,
+  X402SettlementResponse,
+  Parse402FromHeaderResult,
+} from './core/x402-types.js';
+export {
+  isX402Required,
+  parse402AcceptsFromHeader,
+  parse402FromBody,
+  parse402FromHeader,
+  parse402SettlementFromHeader,
+  parse402FromWWWAuthenticate,
+} from './core/x402-types.js';
 

@@ -8,6 +8,27 @@ import type {
   RegistrationFile,
   Endpoint,
 } from '../models/interfaces.js';
+import type {
+  MessageResponse,
+  TaskResponse,
+  Part,
+  MessageA2AOptions,
+  A2APaymentRequired,
+  AgentCardAuth,
+  ListTasksOptions,
+  TaskSummary,
+  AgentTask,
+} from '../models/a2a.js';
+import {
+  sendMessage as sendMessageA2A,
+  listTasks as listTasksA2A,
+  getTask as getTaskA2A,
+  createTaskHandle,
+  applyCredential,
+  normalizeInterfaces,
+  pickInterface,
+} from './a2a-client.js';
+import type { X402Accept } from './x402-types.js';
 import type { AgentId, Address, URI } from '../models/types.js';
 import { EndpointType, TrustModel } from '../models/enums.js';
 import type { SDK } from './sdk.js';
@@ -31,6 +52,17 @@ export class Agent {
   private _dirtyMetadata = new Set<string>();
   private _lastRegisteredWallet?: Address;
   private _lastRegisteredEns?: string;
+  /** Base URL from agent card (chosen interface url) when fetched; avoids path-stripping heuristics. */
+  private _cachedA2aBaseUrl?: string;
+  /** Protocol version from chosen interface when card is fetched. */
+  private _cachedA2aVersion?: string;
+  /** Binding from chosen interface (HTTP+JSON, JSONRPC, or AUTO when card does not declare protocolBinding). */
+  private _cachedA2aBinding?: 'HTTP+JSON' | 'JSONRPC' | 'GRPC' | 'AUTO';
+  /** Tenant from chosen interface when card is fetched. */
+  private _cachedA2aTenant?: string;
+  private _a2aInterfaceResolved = false;
+  /** When set, used as A2A base URL instead of resolving from card (e.g. from discovery). */
+  private _a2aBaseUrlOverride?: string;
 
   constructor(private sdk: SDK, registrationFile: RegistrationFile) {
     this.registrationFile = registrationFile;
@@ -91,19 +123,29 @@ export class Agent {
 
   /**
    * Read the verified agent wallet from the Identity Registry (on-chain).
-   *
-   * Internally calls the contract function `getAgentWallet(agentId)`.
-   * Returns `undefined` if unset/cleared (zero address).
+   * When registrationFile.walletAddress is set (e.g. from discovery or for testing), returns it
+   * without a chain read so agents can be used with a known wallet without chain.
    */
   async getWallet(): Promise<Address | undefined> {
+    if (this.registrationFile.walletAddress) {
+      return this.registrationFile.walletAddress;
+    }
     if (!this.registrationFile.agentId) {
       throw new Error('Agent must be registered before reading wallet from chain.');
     }
 
-    const { tokenId } = parseAgentId(this.registrationFile.agentId);
-    const identityRegistryAddress = this.sdk.identityRegistryAddress();
+    const { chainId, tokenId } = parseAgentId(this.registrationFile.agentId);
+    const currentChainId = await this.sdk.chainId();
+    const client =
+      chainId === currentChainId
+        ? this.sdk.chainClient
+        : this.sdk.getChainClientForChain(chainId);
+    const identityRegistryAddress =
+      chainId === currentChainId
+        ? this.sdk.identityRegistryAddress()
+        : this.sdk.getIdentityRegistryAddressForChain(chainId);
 
-    const wallet = await this.sdk.chainClient.readContract<Address>({
+    const wallet = await client.readContract<Address>({
       address: identityRegistryAddress,
       abi: IDENTITY_REGISTRY_ABI,
       functionName: 'getAgentWallet',
@@ -179,9 +221,11 @@ export class Agent {
     if (autoFetch) {
       try {
         const capabilities = await this._endpointCrawler.fetchA2aCapabilities(agentcard);
-        if (capabilities?.a2aSkills) {
-          meta.a2aSkills = capabilities.a2aSkills;
+        if (capabilities?.a2aSkills) meta.a2aSkills = capabilities.a2aSkills;
+        if (capabilities?.securitySchemes && Object.keys(capabilities.securitySchemes).length > 0) {
+          meta.securitySchemes = capabilities.securitySchemes;
         }
+        if (capabilities?.security?.length) meta.security = capabilities.security;
       } catch (error) {
         // Soft fail - continue without capabilities
       }
@@ -197,6 +241,259 @@ export class Agent {
     this.registrationFile.updatedAt = Math.floor(Date.now() / 1000);
 
     return this;
+  }
+
+  /**
+   * Resolve A2A interface once: fetch agent card and cache chosen interface (base URL, version, binding, tenant).
+   * Prefer card-declared URL over deriving from endpoint value.
+   * Discovery fallback: if endpoint is a host/base (no card path), try /.well-known/agent-card.json then /.well-known/agent.json on 404.
+   */
+  private async _resolveA2aInterface(): Promise<void> {
+    if (this._a2aInterfaceResolved) return;
+    this._a2aInterfaceResolved = true;
+    const endpoint = this.a2aEndpoint;
+    if (!endpoint || !endpoint.startsWith('http')) return;
+    try {
+      let data: Record<string, unknown> | null = null;
+      const pathname = new URL(endpoint).pathname || '';
+      const looksLikeCardUrl = /\/(\.well-known\/)?(agent-card|agent)\.json$/i.test(pathname);
+
+      if (looksLikeCardUrl) {
+        const res = await fetch(endpoint, { signal: AbortSignal.timeout(5000), redirect: 'follow' });
+        if (res.ok) data = (await res.json()) as Record<string, unknown>;
+      } else {
+        const base = endpoint.replace(/\/+$/, '');
+        const cardPaths = ['/.well-known/agent-card.json', '/.well-known/agent.json'];
+        for (const p of cardPaths) {
+          const res = await fetch(`${base}${p}`, { signal: AbortSignal.timeout(5000), redirect: 'follow' });
+          if (res.ok) {
+            data = (await res.json()) as Record<string, unknown>;
+            break;
+          }
+          if (res.status !== 404) break;
+        }
+      }
+
+      if (data) {
+        const interfaces = normalizeInterfaces(data as Record<string, unknown>);
+        const chosen = pickInterface(interfaces, ['HTTP+JSON', 'JSONRPC']);
+        if (chosen) {
+          this._cachedA2aBaseUrl = chosen.url;
+          this._cachedA2aVersion = chosen.version;
+          this._cachedA2aBinding = chosen.binding;
+          this._cachedA2aTenant = chosen.tenant;
+        } else {
+          const fromInterface = Array.isArray(data.supportedInterfaces) && data.supportedInterfaces.length > 0
+            ? (data.supportedInterfaces[0] as Record<string, unknown>)?.url
+            : undefined;
+          const fromAdditional = Array.isArray(data.additionalInterfaces) && data.additionalInterfaces.length > 0
+            ? (data.additionalInterfaces[0] as Record<string, unknown>)?.url
+            : undefined;
+          const url = (typeof fromInterface === 'string' ? fromInterface : undefined)
+            ?? (typeof data.url === 'string' ? data.url : undefined)
+            ?? (typeof fromAdditional === 'string' ? fromAdditional : undefined);
+          if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+            this._cachedA2aBaseUrl = url.replace(/\/$/, '');
+          }
+          const versionFromInterface = Array.isArray(data.supportedInterfaces) && data.supportedInterfaces.length > 0
+            ? (data.supportedInterfaces[0] as Record<string, unknown>)?.protocolVersion
+            : undefined;
+          const versionFromAdditional = Array.isArray(data.additionalInterfaces) && data.additionalInterfaces.length > 0
+            ? (data.additionalInterfaces[0] as Record<string, unknown>)?.protocolVersion
+            : undefined;
+          const version = (typeof versionFromInterface === 'string' ? versionFromInterface : undefined)
+            ?? (typeof versionFromAdditional === 'string' ? versionFromAdditional : undefined)
+            ?? (typeof data.protocolVersion === 'string' ? data.protocolVersion : undefined)
+            ?? (typeof data.version === 'string' ? data.version : undefined);
+          if (version) this._cachedA2aVersion = version;
+        }
+      }
+    } catch {
+      // Ignore; _getA2aBaseUrl will use fallback derivation
+    }
+  }
+
+  /**
+   * Override A2A base URL (e.g. from discovery). Use when you know the working base from another source.
+   */
+  setA2aBaseUrlOverride(baseUrl: string): this {
+    this._a2aBaseUrlOverride = baseUrl.replace(/\/+$/, '');
+    return this;
+  }
+
+  /**
+   * Resolve A2A base URL: prefer override, then cached value from agent card (supportedInterfaces[0].url or url), else derive from endpoint value.
+   * Strip both well-known card paths (agent-card.json and agent.json) so derivation matches discovery fallbacks.
+   */
+  private _getA2aBaseUrl(): string {
+    if (this._a2aBaseUrlOverride) return this._a2aBaseUrlOverride;
+    if (this._cachedA2aBaseUrl) return this._cachedA2aBaseUrl;
+    const endpoint = this.a2aEndpoint;
+    if (!endpoint) throw new Error('Agent has no A2A endpoint');
+    try {
+      const u = new URL(endpoint);
+      let pathname = u.pathname;
+      // Strip well-known card suffix so path prefixes (e.g. /v1, /v2) are preserved; support both standard paths.
+      if (/\/(\.well-known\/)?(agent-card|agent)\.json$/i.test(pathname)) {
+        pathname = pathname.replace(/\/(\.well-known\/)?(agent-card|agent)\.json$/i, '') || '/';
+      }
+      if (!pathname || pathname === '/') pathname = '';
+      u.pathname = pathname;
+      u.search = '';
+      u.hash = '';
+      return u.toString().replace(/\/$/, '');
+    } catch {
+      throw new Error('Invalid A2A endpoint URL');
+    }
+  }
+
+  /**
+   * Unified message entry point (spec §1.0). Sends via A2A when the agent has an A2A endpoint.
+   * Throws if the agent has no A2A endpoint.
+   */
+  async message(
+    content: string | { parts: Part[] },
+    options?: MessageA2AOptions
+  ): Promise<
+    | MessageResponse
+    | TaskResponse
+    | A2APaymentRequired<MessageResponse | TaskResponse>
+  > {
+    if (!this.a2aEndpoint) {
+      throw new Error('Agent has no A2A endpoint; messaging is only supported via A2A.');
+    }
+    return this.messageA2A(content, options);
+  }
+
+  /**
+   * Send a message to the agent's A2A endpoint. Returns either a direct MessageResponse
+   * or a TaskResponse when the server creates a task. On HTTP 402, returns x402Required
+   * and x402Payment.pay() to pay and retry (per spec §2.1, §4).
+   */
+  async messageA2A(
+    content: string | { parts: Part[] },
+    options?: MessageA2AOptions
+  ): Promise<MessageResponse | TaskResponse | A2APaymentRequired<MessageResponse | TaskResponse>> {
+    await this._resolveA2aInterface();
+    const baseUrl = this._getA2aBaseUrl();
+    const ep = this.registrationFile.endpoints.find((e) => e.type === EndpointType.A2A);
+    const a2aVersion = this._cachedA2aVersion ?? (ep?.meta?.version as string) ?? '0.3';
+    const auth = this._getA2aAuthFromMeta(ep?.meta);
+    const x402Deps = this.sdk.getX402RequestDeps?.();
+    const binding = this._cachedA2aBinding;
+    return sendMessageA2A(
+      { baseUrl, a2aVersion, content, options, auth, tenant: this._cachedA2aTenant, binding },
+      x402Deps
+    );
+  }
+
+  /** Build AgentCardAuth from endpoint meta (securitySchemes + security from crawler). */
+  private _getA2aAuthFromMeta(meta: Record<string, unknown> | undefined): AgentCardAuth | undefined {
+    if (!meta) return undefined;
+    const schemes = meta.securitySchemes;
+    const security = meta.security;
+    const hasSchemes =
+      schemes && typeof schemes === 'object' && !Array.isArray(schemes) && Object.keys(schemes).length > 0;
+    const hasSecurity = Array.isArray(security) && security.length > 0;
+    if (!hasSchemes && !hasSecurity) return undefined;
+    const auth: AgentCardAuth = {};
+    if (hasSchemes) auth.securitySchemes = schemes as AgentCardAuth['securitySchemes'];
+    if (hasSecurity) auth.security = security as AgentCardAuth['security'];
+    return auth;
+  }
+
+  /**
+   * List tasks for this agent (GET /tasks with filter). Fetches all pages internally.
+   * May return x402Required if the list endpoint returns 402 (see §2.3, §4).
+   */
+  async listTasks(
+    options?: ListTasksOptions
+  ): Promise<TaskSummary[] | A2APaymentRequired<TaskSummary[]>> {
+    await this._resolveA2aInterface();
+    const baseUrl = this._getA2aBaseUrl();
+    const ep = this.registrationFile.endpoints.find((e) => e.type === EndpointType.A2A);
+    const a2aVersion = this._cachedA2aVersion ?? (ep?.meta?.version as string) ?? '0.3';
+    const auth = this._getA2aAuthFromMeta(ep?.meta);
+    const x402Deps = this.sdk.getX402RequestDeps?.();
+    return listTasksA2A({ baseUrl, a2aVersion, options, auth, tenant: this._cachedA2aTenant }, x402Deps);
+  }
+
+  /**
+   * Load a task by ID. Returns same AgentTask as response.task (query, message, cancel).
+   * When the server requires auth, pass options.credential. May return x402Required (see §2.2, §4).
+   * Optional options.payment sends with first request (spec §4.2).
+   */
+  async loadTask(
+    taskId: string,
+    options?: {
+      credential?: string | import('../models/a2a.js').CredentialObject;
+      payment?: string;
+    }
+  ): Promise<AgentTask | A2APaymentRequired<AgentTask>> {
+    await this._resolveA2aInterface();
+    const baseUrl = this._getA2aBaseUrl();
+    const ep = this.registrationFile.endpoints.find((e) => e.type === EndpointType.A2A);
+    const a2aVersion = this._cachedA2aVersion ?? (ep?.meta?.version as string) ?? '0.3';
+    const cardAuth = this._getA2aAuthFromMeta(ep?.meta);
+    const resolvedAuth =
+      options?.credential != null && cardAuth ? applyCredential(options.credential, cardAuth) : undefined;
+    const x402Deps = this.sdk.getX402RequestDeps?.();
+
+    const result = await getTaskA2A(
+      baseUrl,
+      a2aVersion,
+      taskId,
+      resolvedAuth,
+      x402Deps,
+      options?.payment,
+      this._cachedA2aTenant
+    );
+
+    if (result.x402Required) {
+      return {
+        x402Required: true,
+        x402Payment: {
+          ...result.x402Payment,
+          pay: async (accept?: X402Accept | number) => {
+            const summary = await result.x402Payment.pay(accept);
+            return createTaskHandle(
+              baseUrl,
+              a2aVersion,
+              summary.taskId,
+              summary.contextId,
+              x402Deps,
+              resolvedAuth,
+              this._cachedA2aTenant
+            );
+          },
+          payFirst: result.x402Payment.payFirst
+            ? async () => {
+                const summary = await result.x402Payment.payFirst!();
+                return createTaskHandle(
+                  baseUrl,
+                  a2aVersion,
+                  summary.taskId,
+                  summary.contextId,
+                  x402Deps,
+                  resolvedAuth,
+                  this._cachedA2aTenant
+                );
+              }
+            : undefined,
+        },
+      };
+    }
+
+    const summary = result as TaskSummary;
+    return createTaskHandle(
+      baseUrl,
+      a2aVersion,
+      summary.taskId,
+      summary.contextId,
+      x402Deps,
+      resolvedAuth,
+      this._cachedA2aTenant
+    );
   }
 
   setENS(name: string, version: string = '1.0'): this {
@@ -427,6 +724,7 @@ export class Agent {
       signature?: string | Uint8Array;
     }
   ): Promise<TransactionHandle<RegistrationFile> | undefined> {
+    await this._ensureAgentOnCurrentChain();
     if (!this.registrationFile.agentId) {
       throw new Error(
         'Agent must be registered before setting agentWallet on-chain. ' +
@@ -692,6 +990,7 @@ export class Agent {
    * Returns txHash (or "" if it was already unset).
    */
   async unsetWallet(): Promise<TransactionHandle<RegistrationFile> | undefined> {
+    await this._ensureAgentOnCurrentChain();
     if (!this.registrationFile.agentId) {
       throw new Error(
         'Agent must be registered before unsetting agentWallet on-chain. ' +
@@ -790,6 +1089,22 @@ export class Agent {
   }
 
   /**
+   * Throw if the agent is registered on a different chain than the SDK is configured for.
+   * Used by write paths (register, setWallet, transfer, etc.).
+   */
+  private async _ensureAgentOnCurrentChain(): Promise<void> {
+    const id = this.registrationFile.agentId;
+    if (!id) return;
+    const { chainId } = parseAgentId(id);
+    const current = await this.sdk.chainId();
+    if (chainId !== current) {
+      throw new Error(
+        `Agent ${id} is on chain ${chainId}. Switch SDK to that chain to update it, or load the agent on chain ${current}.`
+      );
+    }
+  }
+
+  /**
    * Update basic agent information
    */
   updateInfo(name?: string, description?: string, image?: URI): this {
@@ -837,6 +1152,7 @@ export class Agent {
    * Register agent on-chain with IPFS flow
    */
   async registerIPFS(): Promise<TransactionHandle<RegistrationFile>> {
+    await this._ensureAgentOnCurrentChain();
     // Validate basic info
     if (!this.registrationFile.name || !this.registrationFile.description) {
       throw new Error('Agent must have name and description before registration');
@@ -941,6 +1257,7 @@ export class Agent {
    * Register agent on-chain with HTTP URI
    */
   async registerHTTP(agentUri: string): Promise<TransactionHandle<RegistrationFile>> {
+    await this._ensureAgentOnCurrentChain();
     // Validate basic info
     if (!this.registrationFile.name || !this.registrationFile.description) {
       throw new Error('Agent must have name and description before registration');
@@ -1001,6 +1318,7 @@ export class Agent {
   async transfer(
     newOwner: Address
   ): Promise<TransactionHandle<{ txHash: string; from: Address; to: Address; agentId: AgentId }>> {
+    await this._ensureAgentOnCurrentChain();
     if (!this.registrationFile.agentId) {
       throw new Error('Agent must be registered before transfer');
     }

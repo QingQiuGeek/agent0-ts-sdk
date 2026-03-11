@@ -25,17 +25,26 @@ import { SubgraphClient } from './subgraph-client.js';
 import { FeedbackManager } from './feedback-manager.js';
 import { AgentIndexer } from './indexer.js';
 import { Agent } from './agent.js';
+import { A2AClientFromSummary } from './a2a-summary-client.js';
 import type { TransactionHandle } from './transaction-handle.js';
 import {
   DEFAULT_REGISTRIES,
+  DEFAULT_RPC_URLS,
   DEFAULT_SUBGRAPH_URLS,
   IDENTITY_REGISTRY_ABI,
   REPUTATION_REGISTRY_ABI,
 } from './contracts.js';
+import { requestWithX402, type X402RequestDeps } from './x402-request.js';
+import { buildEvmPayment, checkEvmBalance } from './x402-payment.js';
+import type { X402RequestOptions, X402RequestResult } from './x402-types.js';
 
 export interface SDKConfig {
   chainId: ChainId;
-  rpcUrl: string;
+  /**
+   * RPC URL for the primary chain. Optional when a built-in default exists for `chainId`.
+   * Overrides DEFAULT_RPC_URLS for this chain when provided.
+   */
+  rpcUrl?: string;
   /**
    * Backwards-compatible alias for `privateKey` (accepts a hex private key string).
    */
@@ -65,6 +74,11 @@ export interface SDKConfig {
   subgraphUrl?: string;
   subgraphOverrides?: Record<ChainId, string>;
   /**
+   * Per-chain RPC URL overrides (e.g. for x402 payments on other chains).
+   * Applied after built-in defaults and config.rpcUrl. Example: { 84532: 'https://base-sepolia.drpc.org' }.
+   */
+  overrideRpcUrls?: Record<number, string>;
+  /**
    * Max decoded bytes for ERC-8004 JSON base64 data URIs (on-chain registration files).
    * Default: 256 KiB.
    */
@@ -81,27 +95,50 @@ export class SDK {
   private readonly _feedbackManager: FeedbackManager;
   private readonly _indexer: AgentIndexer;
   private readonly _registries: Record<string, Address>;
+  private readonly _registryOverrides: Record<ChainId, Record<string, Address>>;
   private readonly _chainId: ChainId;
   private readonly _subgraphUrls: Record<ChainId, string> = {};
   private readonly _hasSignerConfig: boolean;
+  private readonly _rpcUrls: Record<number, string>;
+  private readonly _paymentChainClients = new Map<number, ChainClient>();
+  private readonly _readOnlyChainClients = new Map<number, ChainClient>();
+  private readonly _signerForPayment: { privateKey?: string; walletProvider?: Eip1193Provider };
   private readonly _registrationDataUriMaxBytes: number;
 
   constructor(config: SDKConfig) {
     this._chainId = config.chainId;
+    // Merge order: defaults → rpcUrl (primary chain) → overrideRpcUrls
+    this._rpcUrls = { ...DEFAULT_RPC_URLS };
+    if (config.rpcUrl?.trim()) {
+      this._rpcUrls[config.chainId] = config.rpcUrl.trim();
+    }
+    if (config.overrideRpcUrls) {
+      for (const [chainId, url] of Object.entries(config.overrideRpcUrls)) {
+        if (url?.trim()) this._rpcUrls[Number(chainId)] = url.trim();
+      }
+    }
+    const mainRpc = this._rpcUrls[config.chainId];
+    if (!mainRpc?.trim()) {
+      throw new Error(
+        `No RPC URL for chain ${config.chainId}. Provide rpcUrl or add the chain to overrideRpcUrls in SDK config.`
+      );
+    }
+    const privateKey = config.privateKey ?? config.signer;
+    this._signerForPayment = { privateKey, walletProvider: config.walletProvider };
     this._registrationDataUriMaxBytes = config.registrationDataUriMaxBytes ?? 256 * 1024;
 
     // Initialize Chain client (viem-only)
-    const privateKey = config.privateKey ?? config.signer;
     this._hasSignerConfig = Boolean(privateKey || config.walletProvider);
     this._chainClient = new ViemChainClient({
       chainId: config.chainId,
-      rpcUrl: config.rpcUrl,
+      rpcUrl: mainRpc,
       privateKey,
       walletProvider: config.walletProvider,
     });
 
     // Resolve registry addresses
     const registryOverrides = config.registryOverrides || {};
+    this._registryOverrides = registryOverrides;
     const defaultRegistries = DEFAULT_REGISTRIES[config.chainId] || {};
     this._registries = { ...defaultRegistries, ...(registryOverrides[config.chainId] || {}) };
 
@@ -225,6 +262,51 @@ export class SDK {
     return undefined;
   }
 
+  /**
+   * Return the chain client to use for building an x402 payment for the given accept.
+   * Uses the accept's network (e.g. eip155:84532) so the signature matches the chain the server verifies.
+   */
+  private getChainClientForAccept(accept: { network?: string; [key: string]: unknown }): ChainClient {
+    const raw = accept?.network ?? String(this._chainId);
+    const m = String(raw).match(/^eip155:(\d+)$/);
+    const chainId = m ? parseInt(m[1]!, 10) : parseInt(String(raw), 10);
+    if (Number.isNaN(chainId)) return this._chainClient;
+    if (chainId === this._chainId) return this._chainClient;
+    const cached = this._paymentChainClients.get(chainId);
+    if (cached) return cached;
+    const rpcUrl = this._rpcUrls[chainId];
+    if (!rpcUrl?.trim()) {
+      throw new Error(
+        `x402: payment option requires chain ${chainId} but SDK is configured for chain ${this._chainId}. ` +
+          `Add overrideRpcUrls: { ${chainId}: 'https://...' } to SDK config to pay on that chain.`
+      );
+    }
+    const client = new ViemChainClient({
+      chainId,
+      rpcUrl: rpcUrl.trim(),
+      privateKey: this._signerForPayment.privateKey,
+      walletProvider: this._signerForPayment.walletProvider,
+    });
+    this._paymentChainClients.set(chainId, client);
+    return client;
+  }
+
+  /**
+   * Perform an HTTP request with built-in x402 (402 Payment Required) handling.
+   * On 2xx returns the parsed result (default: JSON body); on 402 returns { x402Required: true, x402Payment } (no throw).
+   * Use x402Payment.pay() to pay and retry.
+   */
+  async request<T = object>(options: X402RequestOptions<T>): Promise<X402RequestResult<T>> {
+    return requestWithX402(options, this.getX402RequestDeps());
+  }
+
+  /**
+   * Alias for request() for x402-specific usage.
+   */
+  async fetchWithX402<T = object>(options: X402RequestOptions<T>): Promise<X402RequestResult<T>> {
+    return this.request(options);
+  }
+
   identityRegistryAddress(): Address {
       const address = this._registries.IDENTITY;
     if (!address) throw new Error(`No identity registry address for chain ${this._chainId}`);
@@ -243,6 +325,43 @@ export class SDK {
   validationRegistryAddress(): Address {
       const address = this._registries.VALIDATION;
     if (!address) throw new Error(`No validation registry address for chain ${this._chainId}`);
+    return address;
+  }
+
+  /**
+   * Get a chain client for the given chain (for reads, e.g. loadAgent or getWallet on another chain).
+   * Returns the SDK's main chain client when chainId matches; otherwise a read-only cached client.
+   */
+  getChainClientForChain(chainId: ChainId): ChainClient {
+    if (chainId === this._chainId) {
+      return this._chainClient;
+    }
+    const cached = this._readOnlyChainClients.get(chainId);
+    if (cached) return cached;
+    const rpcUrl = this._rpcUrls[chainId];
+    if (!rpcUrl?.trim()) {
+      throw new Error(
+        `To load agents from chain ${chainId}, add overrideRpcUrls: { ${chainId}: 'https://...' } to SDK config.`
+      );
+    }
+    const client = new ViemChainClient({
+      chainId,
+      rpcUrl: rpcUrl.trim(),
+    });
+    this._readOnlyChainClients.set(chainId, client);
+    return client;
+  }
+
+  /**
+   * Get identity registry address for the given chain (for reads when loading or querying agents on that chain).
+   */
+  getIdentityRegistryAddressForChain(chainId: ChainId): Address {
+    const address =
+      (DEFAULT_REGISTRIES[chainId]?.IDENTITY as Address | undefined) ??
+      this._registryOverrides[chainId]?.IDENTITY;
+    if (!address) {
+      throw new Error(`Chain ${chainId} has no identity registry configured.`);
+    }
     return address;
   }
 
@@ -277,22 +396,21 @@ export class SDK {
   }
 
   /**
-   * Load an existing agent (hydrates from registration file if registered)
+   * Load an existing agent (hydrates from registration file if registered).
+   * Supports loading agents from any chain; use the same SDK chain to update them.
    */
   async loadAgent(agentId: AgentId): Promise<Agent> {
     // Parse agent ID
     const { chainId, tokenId } = parseAgentId(agentId);
 
-    const currentChainId = await this.chainId();
-    if (chainId !== currentChainId) {
-      throw new Error(`Agent ${agentId} is not on current chain ${currentChainId}`);
-    }
+    const client = this.getChainClientForChain(chainId);
+    const registry = this.getIdentityRegistryAddressForChain(chainId);
 
     // Get agent URI from contract
     let agentURI: string;
     try {
-      agentURI = await this._chainClient.readContract<string>({
-        address: this.identityRegistryAddress(),
+      agentURI = await client.readContract<string>({
+        address: registry,
         abi: IDENTITY_REGISTRY_ABI,
         functionName: 'tokenURI',
         args: [BigInt(tokenId)],
@@ -364,6 +482,19 @@ export class SDK {
   }
 
   /**
+   * Create an A2A client from a loaded Agent or an AgentSummary.
+   * When given an Agent, returns it as-is (Agent already has messageA2A, listTasks, loadTask).
+   * When given an AgentSummary, returns an A2AClientFromSummary that resolves the agent card from summary.a2a on first use.
+   * Use this to treat agents and summaries interchangeably for A2A.
+   */
+  createA2AClient(agentOrSummary: Agent | AgentSummary): Agent | A2AClientFromSummary {
+    if (agentOrSummary instanceof Agent) {
+      return agentOrSummary;
+    }
+    return new A2AClientFromSummary(this, agentOrSummary);
+  }
+
+  /**
    * Transfer agent ownership
    */
   async transferAgent(
@@ -378,9 +509,11 @@ export class SDK {
    * Check if address is agent owner
    */
   async isAgentOwner(agentId: AgentId, address: Address): Promise<boolean> {
-    const { tokenId } = parseAgentId(agentId);
-    const owner = await this._chainClient.readContract<string>({
-      address: this.identityRegistryAddress(),
+    const { chainId, tokenId } = parseAgentId(agentId);
+    const client = this.getChainClientForChain(chainId);
+    const registry = this.getIdentityRegistryAddressForChain(chainId);
+    const owner = await client.readContract<string>({
+      address: registry,
       abi: IDENTITY_REGISTRY_ABI,
       functionName: 'ownerOf',
       args: [BigInt(tokenId)],
@@ -392,9 +525,11 @@ export class SDK {
    * Get agent owner
    */
   async getAgentOwner(agentId: AgentId): Promise<Address> {
-    const { tokenId } = parseAgentId(agentId);
-    return await this._chainClient.readContract<Address>({
-      address: this.identityRegistryAddress(),
+    const { chainId, tokenId } = parseAgentId(agentId);
+    const client = this.getChainClientForChain(chainId);
+    const registry = this.getIdentityRegistryAddressForChain(chainId);
+    return await client.readContract<Address>({
+      address: registry,
       abi: IDENTITY_REGISTRY_ABI,
       functionName: 'ownerOf',
       args: [BigInt(tokenId)],
@@ -746,6 +881,26 @@ export class SDK {
     }
     
     return {};
+  }
+
+  /**
+   * Returns deps for x402-aware requests (fetch + buildPayment + checkBalance).
+   * Used by A2A client so messageA2A and task methods can return 402 + pay() or payFirst() instead of throwing.
+   */
+  getX402RequestDeps(): X402RequestDeps {
+    return {
+      fetch: globalThis.fetch,
+      buildPayment: (accept, snapshot) =>
+        buildEvmPayment(accept, this.getChainClientForAccept(accept), snapshot),
+      checkBalance: async (accept) => {
+        try {
+          const client = this.getChainClientForAccept(accept);
+          return await checkEvmBalance(accept, client);
+        } catch {
+          return false;
+        }
+      },
+    };
   }
 
   // Expose clients for advanced usage
